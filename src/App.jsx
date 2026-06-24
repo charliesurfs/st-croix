@@ -12,6 +12,7 @@ const ME_KEY = "stx_me";
 const RLABELS = ["Don't want", "Eh", "Maybe", "Want to", "Really want"];
 const PHASE = { early: "early trip", mid: "mid trip", late: "late trip" };
 const DAY_BUDGET = 540; // ~9 hrs of daytime activity
+const PIN_RE = /^\d{4,6}$/;
 const fmtTime = (t) => { if (!t) return ""; const [h, m] = t.split(":").map(Number); return `${((h + 11) % 12) + 1}:${String(m).padStart(2, "0")} ${h < 12 ? "AM" : "PM"}`; };
 const dow = (d) => d ? ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"][new Date(d + "T12:00").getDay()] : "";
 const todayStr = () => { const t = new Date(); return `${t.getFullYear()}-${String(t.getMonth() + 1).padStart(2, "0")}-${String(t.getDate()).padStart(2, "0")}`; };
@@ -29,6 +30,12 @@ const groupAvg = (a, ratings) => {
   const rs = ratings.filter((r) => r.activity_id === a.id);
   return rs.length ? rs.reduce((s, r) => s + r.want, 0) / rs.length : null;
 };
+const hasClaimedPin = (m) => Boolean(m && m.claimed && m.pin_hash);
+const needsClaimPin = (m) => Boolean(m && !hasClaimedPin(m));
+const hashPin = async (pin) => {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(pin));
+  return Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, "0")).join("");
+};
 
 export default function App() {
   const [trip, setTrip] = useState(null);
@@ -39,6 +46,7 @@ export default function App() {
   const [mustDos, setMustDos] = useState([]);
   const [meId, setMeId] = useState(() => localStorage.getItem(ME_KEY) || null);
   const [status, setStatus] = useState("loading");
+  const [gate, setGate] = useState({ mode: "grid", memberId: null });
   const [weather, setWeather] = useState(null);
   const [view, setView] = useState("activities");   // 'activities' (Stage 1) | 'itinerary' (Stage 2 + live)
   const [sortMode, setSortMode] = useState("wanted"); // 'wanted' | 'when'
@@ -59,9 +67,32 @@ export default function App() {
       supabase.from("ratings").select("*"),
       supabase.from("must_dos").select("*")
     ]);
-    setTrip(t); setMembers(m.data || []); setDays(d.data || []);
+    const nextMembers = m.data || [];
+    setTrip(t); setMembers(nextMembers); setDays(d.data || []);
     setActs(a.data || []); setRatings(r.data || []); setMustDos(md.data || []);
-    setStatus((m.data || []).some((x) => x.id === localStorage.getItem(ME_KEY)) ? "ready" : "needsMe");
+    const storedId = localStorage.getItem(ME_KEY);
+    const storedMember = nextMembers.find((x) => x.id === storedId) || null;
+    if (storedMember) {
+      setMeId(storedMember.id);
+      if (needsClaimPin(storedMember)) {
+        setGate({ mode: "claim", memberId: storedMember.id });
+        setStatus("needsMe");
+      } else {
+        setGate({ mode: "grid", memberId: null });
+        setStatus("ready");
+      }
+      return;
+    }
+    setMeId(null);
+    setStatus("needsMe");
+    setGate((prev) => {
+      if (!prev.memberId) return { mode: "grid", memberId: null };
+      const selected = nextMembers.find((x) => x.id === prev.memberId);
+      if (!selected) return { mode: "grid", memberId: null };
+      if (prev.mode === "claim") return needsClaimPin(selected) ? prev : { mode: "pin", memberId: selected.id };
+      if (prev.mode === "pin") return needsClaimPin(selected) ? { mode: "claim", memberId: selected.id } : prev;
+      return prev;
+    });
   }, []);
 
   useEffect(() => { loadAll(); }, [loadAll]);
@@ -72,13 +103,48 @@ export default function App() {
       .on("postgres_changes", { event: "*", schema: "public", table: "ratings" }, reload)
       .on("postgres_changes", { event: "*", schema: "public", table: "must_dos" }, reload)
       .on("postgres_changes", { event: "*", schema: "public", table: "days" }, reload)
+      .on("postgres_changes", { event: "*", schema: "public", table: "members" }, reload)
       .subscribe();
     return () => { supabase.removeChannel(ch); };
   }, [loadAll]);
   useEffect(() => { getWeather().then(setWeather).catch(() => setWeather("err")); }, []);
 
   const me = members.find((x) => x.id === meId) || null;
-  const pickMe = (id) => { localStorage.setItem(ME_KEY, id); setMeId(id); setStatus("ready"); };
+  const enterAppAs = (id) => {
+    localStorage.setItem(ME_KEY, id);
+    setMeId(id);
+    setGate({ mode: "grid", memberId: null });
+    setStatus("ready");
+  };
+  const resetIdentity = () => {
+    localStorage.removeItem(ME_KEY);
+    setMeId(null);
+    setGate({ mode: "grid", memberId: null });
+    setStatus("needsMe");
+  };
+  const chooseMember = (member) => { setGate({ mode: hasClaimedPin(member) ? "pin" : "claim", memberId: member.id }); };
+  const claimMember = async (member, pin) => {
+    const pin_hash = await hashPin(pin);
+    const { data, error } = await supabase
+      .from("members")
+      .update({ pin_hash, claimed: true })
+      .eq("id", member.id)
+      .eq("claimed", false)
+      .select("*");
+    if (error) throw error;
+    const row = data && data[0];
+    if (!row) {
+      await loadAll();
+      throw new Error("That name was just claimed on another device. Enter the PIN to continue.");
+    }
+    setMembers((prev) => prev.map((x) => (x.id === member.id ? { ...x, ...row } : x)));
+    enterAppAs(member.id);
+  };
+  const verifyMemberPin = async (member, pin) => {
+    const pin_hash = await hashPin(pin);
+    if (pin_hash !== member.pin_hash) throw new Error("Wrong PIN.");
+    enterAppAs(member.id);
+  };
 
   // mutations
   const setWant = (a, val) => {
@@ -112,13 +178,8 @@ export default function App() {
 
   if (status === "loading") return <div className="center">Loading the trip…</div>;
   if (status === "error") return <div className="center">Couldn't reach the trip. Check your Supabase URL/key in <code>.env</code> and that the schema + migration ran.</div>;
-  if (status === "needsMe") return (
-    <div className="gate"><div className="gatecard">
-      <h2 className="display">Who are you?</h2>
-      <p>Pick yourself so your ratings and must-dos are tagged to you. Adds stay anonymous.</p>
-      {members.map((m) => <button key={m.id} className="gatebtn" onClick={() => pickMe(m.id)}><span className="mswatch" style={{ background: m.color }} />{m.name}{m.role === "arbiter" ? " · final say" : ""}</button>)}
-    </div></div>
-  );
+  if (status === "needsMe") return <IdentityGate members={members} gate={gate} onChooseMember={chooseMember} onClaimPin={claimMember} onEnterPin={verifyMemberPin} onBack={resetIdentity} />;
+  if (!me) return <div className="center">Refreshing your trip seat...</div>;
 
   const myMustCount = mustDos.filter((x) => x.member_id === meId).length;
   const limit = me ? me.must_do_limit : null;
@@ -239,7 +300,7 @@ export default function App() {
           <div><div className="eyebrow">U.S. Virgin Islands</div><h1 className="display">{trip.name}</h1><div className="dates mono">Aug 19–26, 2026</div></div>
           <div style={{ textAlign: "right", display: "flex", flexDirection: "column", gap: 8, alignItems: "flex-end" }}>
             <span className="sync"><span className="d" /> live</span>
-            <button className="mebtn" onClick={() => { localStorage.removeItem(ME_KEY); setMeId(null); setStatus("needsMe"); }}>I'm {me.name} ▾</button>
+            <button className="mebtn" onClick={resetIdentity}>I'm {me.name} ▾</button>
           </div>
         </div>
       </div></header>
@@ -253,6 +314,81 @@ export default function App() {
 
       {sheet && <AddSheet sheet={sheet} onClose={() => setSheet(null)} onAdd={addActivity} />}
     </div>
+  );
+}
+
+function IdentityGate({ members, gate, onChooseMember, onClaimPin, onEnterPin, onBack }) {
+  const member = members.find((x) => x.id === gate.memberId) || null;
+  const [pin, setPin] = useState("");
+  const [confirmPin, setConfirmPin] = useState("");
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    setPin("");
+    setConfirmPin("");
+    setError("");
+    setBusy(false);
+  }, [gate.mode, gate.memberId]);
+
+  const changePin = (value, setter) => setter(value.replace(/\D/g, "").slice(0, 6));
+  const submitClaim = async () => {
+    if (!member) return;
+    if (!PIN_RE.test(pin)) { setError("Use a 4-6 digit PIN."); return; }
+    if (pin !== confirmPin) { setError("PINs don't match yet."); return; }
+    setBusy(true);
+    setError("");
+    try { await onClaimPin(member, pin); }
+    catch (err) { setError(err.message || "Couldn't save that PIN."); setBusy(false); }
+  };
+  const submitPin = async () => {
+    if (!member) return;
+    if (!PIN_RE.test(pin)) { setError("Enter your 4-6 digit PIN."); return; }
+    setBusy(true);
+    setError("");
+    try { await onEnterPin(member, pin); }
+    catch (err) { setError(err.message || "Wrong PIN."); setBusy(false); }
+  };
+
+  if ((gate.mode === "claim" || gate.mode === "pin") && member) {
+    const claiming = gate.mode === "claim";
+    // Forgotten PINs are reset manually for this trusted family app:
+    // clear pin_hash and set claimed=false in the Supabase Table Editor.
+    return (
+      <div className="gate"><div className="gatecard">
+        <div className="gatewho"><span className="mswatch" style={{ background: member.color }} />{member.name}{member.role === "arbiter" ? <span className="gaterolepill">final say</span> : null}</div>
+        <h2 className="display">{claiming ? "Set a PIN" : "Enter PIN"}</h2>
+        <p>{claiming ? "Claim your name once with a short PIN. After that, other devices need the PIN, but this phone remembers you." : "That name is already claimed. Enter the short PIN to use it on this device."}</p>
+        <div className="gatefield">
+          <label className="gatelabel" htmlFor="gate-pin">PIN</label>
+          <input id="gate-pin" className="gateinput" type="password" inputMode="numeric" pattern="\d*" autoComplete={claiming ? "new-password" : "current-password"} maxLength={6} value={pin} onChange={(e) => changePin(e.target.value, setPin)} onKeyDown={(e) => { if (e.key === "Enter") claiming ? submitClaim() : submitPin(); }} />
+        </div>
+        {claiming && <div className="gatefield">
+          <label className="gatelabel" htmlFor="gate-pin-confirm">Confirm PIN</label>
+          <input id="gate-pin-confirm" className="gateinput" type="password" inputMode="numeric" pattern="\d*" autoComplete="new-password" maxLength={6} value={confirmPin} onChange={(e) => changePin(e.target.value, setConfirmPin)} onKeyDown={(e) => { if (e.key === "Enter") submitClaim(); }} />
+        </div>}
+        {error && <div className="gateerror">{error}</div>}
+        <button className="gatecta" onClick={claiming ? submitClaim : submitPin} disabled={busy}>{busy ? (claiming ? "Saving..." : "Checking...") : (claiming ? "Claim this name" : "Log in")}</button>
+        <button className="gateback" onClick={onBack} disabled={busy}>Back to names</button>
+      </div></div>
+    );
+  }
+
+  return (
+    <div className="gate"><div className="gatecard">
+      <h2 className="display">Who are you?</h2>
+      <p>Claim your name once with a short PIN. After that, this phone remembers you and other devices need the PIN.</p>
+      <div className="gategrid">
+        {members.map((m) => <button key={m.id} className="gatebtn gatecell" onClick={() => onChooseMember(m)}>
+          <span className="gatecelltop">
+            <span className="mswatch" style={{ background: m.color }} />
+            <span className="gatename">{m.name}</span>
+            {m.claimed && <span className="gatelock" aria-hidden="true" title="Claimed" />}
+          </span>
+          <span className="gatesub">{m.role === "arbiter" ? "final say" : m.claimed ? "PIN on new devices" : "tap to claim"}</span>
+        </button>)}
+      </div>
+    </div></div>
   );
 }
 

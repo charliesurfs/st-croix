@@ -23,6 +23,8 @@ create table if not exists members (
   role text not null default 'member',     -- 'arbiter' (Dad) | 'member'
   color text default '#0E6E6E',
   must_do_limit int default 3,             -- NULL = unlimited (the arbiter)
+  pin_hash text,
+  claimed boolean not null default false,
   created_at timestamptz default now()
 );
 
@@ -133,6 +135,7 @@ create table if not exists pulses (
 
 -- ---------- realtime (run once) ----------
 alter publication supabase_realtime add table activities;
+alter publication supabase_realtime add table members;
 alter publication supabase_realtime add table ratings;
 alter publication supabase_realtime add table must_dos;
 alter publication supabase_realtime add table days;
