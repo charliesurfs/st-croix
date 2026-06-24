@@ -86,10 +86,28 @@ main{padding:16px 16px 64px;}
 
 /* identity gate */
 .gate{min-height:100vh; display:flex; align-items:center; justify-content:center; padding:24px;}
-.gatecard{background:var(--card); border:1px solid var(--line); border-radius:20px; padding:24px; max-width:340px; width:100%; text-align:center;}
+.gatecard{background:var(--card); border:1px solid var(--line); border-radius:20px; padding:24px; max-width:420px; width:100%; text-align:center;}
 .gatecard h2{font-family:'Fraunces',serif; font-size:22px; margin:0 0 4px;}
 .gatecard p{font-size:13px; color:var(--muted); margin:0 0 18px;}
 .gatebtn{display:flex; align-items:center; gap:10px; width:100%; padding:13px; border-radius:12px; border:1.5px solid var(--line); background:#fff; font-size:15px; font-weight:600; margin-bottom:9px; color:var(--ink);}
+.gategrid{display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:10px;}
+.gategrid .gatebtn{margin-bottom:0;}
+.gatecell{align-items:flex-start; flex-direction:column; gap:10px; min-height:104px; text-align:left;}
+.gatecelltop{display:flex; align-items:center; gap:9px; width:100%;}
+.gategrid .mswatch{width:14px; height:14px;}
+.gatename{font-size:15px; font-weight:700;}
+.gatesub{font-size:11px; color:var(--muted); line-height:1.35;}
+.gatelock{margin-left:auto; width:20px; height:20px; border-radius:999px; border:1px solid var(--line); background:var(--glass); display:inline-flex; align-items:center; justify-content:center; color:var(--teal);}
+.gatelock::before{content:"\1F512"; font-size:10px; line-height:1;}
+.gatewho{display:flex; align-items:center; justify-content:center; gap:8px; color:var(--teal); font-size:13px; font-weight:700; margin-bottom:10px;}
+.gaterolepill{font-size:10px; letter-spacing:.08em; text-transform:uppercase; padding:2px 7px; border-radius:999px; border:1px solid #E9D7A8; background:#FBF1DC; color:#9A6A12;}
+.gatefield{text-align:left; margin-bottom:12px;}
+.gatelabel{display:block; font-size:10.5px; letter-spacing:.08em; text-transform:uppercase; color:var(--muted); margin-bottom:6px;}
+.gateinput{width:100%; padding:13px; border-radius:12px; border:1.5px solid var(--line); background:#fff; color:var(--ink); font-size:20px; text-align:center; letter-spacing:.3em; font-family:'DM Mono',ui-monospace,monospace;}
+.gateerror{font-size:12.5px; color:#B23A28; background:#FBE7DF; border:1px solid #F3C5B8; border-radius:12px; padding:10px 12px; margin:0 0 12px; text-align:left;}
+.gatecta{width:100%; padding:14px; border:none; border-radius:13px; background:var(--teal); color:#fff; font-size:14.5px; font-weight:700;}
+.gateback{width:100%; padding:12px; border-radius:12px; border:1.5px solid var(--line); background:transparent; color:var(--muted); font-size:13px; font-weight:600; margin-top:8px;}
+.gatecta:disabled,.gateback:disabled{opacity:.65; cursor:wait;}
 .center{min-height:100vh; display:flex; align-items:center; justify-content:center; color:var(--muted); font-family:'DM Mono',monospace; font-size:13px; padding:24px; text-align:center;}
 
 /* ---------- core-loop additions ---------- */
