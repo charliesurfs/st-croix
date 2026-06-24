@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef, useCallback } from "react";
 import { supabase } from "./supabaseClient.js";
 import { getWeather, wcode } from "./weather.js";
 import { driveTime } from "./data/geo.js";
+import { buildItinerary } from "./data/buildItinerary.js";
 
 const REGION = {
   "Christiansted": "#0E6E6E", "West End": "#C98A1E", "Rainforest & North Shore": "#3F8E5B",
@@ -44,6 +45,8 @@ export default function App() {
   const [sortMode, setSortMode] = useState("wanted"); // 'wanted' | 'when'
   const [sheet, setSheet] = useState(null);
   const [plannerDay, setPlannerDay] = useState(null);
+  const [building, setBuilding] = useState(false);
+  const [buildMsg, setBuildMsg] = useState(null);
   const reloadTimer = useRef(null);
   const wantTimers = useRef({});
 
@@ -110,6 +113,44 @@ export default function App() {
   };
   const draftDay = async (day, list) => { for (const a of list) await supabase.from("activities").update({ status: "scheduled", day_id: day.id }).eq("id", a.id); loadAll(); };
 
+  // ---- Stage 2: auto-build (B1) + manual move / lock (B4) ----
+  const runBuildItinerary = async () => {
+    if (!confirm("Auto-build the week from the rated activities?\n\nThis re-arranges all UNLOCKED items into days. Locked items (your manual placements + anchors) stay put. Times are rough morning/afternoon/evening suggestions — pin real bookings by locking them.")) return;
+    setBuilding(true); setBuildMsg(null);
+    const { assignments, didNotFit } = buildItinerary({ activities: acts, days, ratings, mustDos, members });
+    for (const as of assignments) {
+      if (as.locked) continue; // never touch locked items
+      await supabase.from("activities").update({ day_id: as.day_id, status: "scheduled", start_time: as.start_time, sort: as.sort }).eq("id", as.id);
+    }
+    for (const id of didNotFit) {
+      await supabase.from("activities").update({ status: "maybe_later", day_id: null, start_time: null }).eq("id", id);
+    }
+    const placed = assignments.filter((a) => !a.locked).length;
+    setBuilding(false);
+    setBuildMsg(`Built ${placed} ${placed === 1 ? "activity" : "activities"} into days. ${didNotFit.length} didn't fit — find them under “Maybe later” in Activities. Times are rough; lock anything with a real booking.`);
+    loadAll();
+  };
+  // Manual move to another day -> pins (locks) the item so a rebuild won't move it.
+  const moveToDay = async (a, dayId) => {
+    if (!dayId || dayId === a.day_id) return;
+    const target = acts.filter((x) => x.day_id === dayId && x.status === "scheduled");
+    const maxSort = target.length ? Math.max(...target.map((x) => x.sort || 0)) : -1;
+    await supabase.from("activities").update({ day_id: dayId, status: "scheduled", sort: maxSort + 1, locked: true }).eq("id", a.id);
+    loadAll();
+  };
+  // Reorder within a day (swap sort with neighbour) -> pins the moved item.
+  const reorderInDay = async (a, dir) => {
+    const list = acts.filter((x) => x.day_id === a.day_id && x.status === "scheduled").sort((x, y) => (x.sort || 0) - (y.sort || 0));
+    const i = list.findIndex((x) => x.id === a.id);
+    const j = dir === "up" ? i - 1 : i + 1;
+    if (i < 0 || j < 0 || j >= list.length) return;
+    const b = list[j];
+    await supabase.from("activities").update({ sort: b.sort || 0, locked: true }).eq("id", a.id);
+    await supabase.from("activities").update({ sort: a.sort || 0 }).eq("id", b.id);
+    loadAll();
+  };
+  const toggleLock = async (a) => { await supabase.from("activities").update({ locked: !a.locked }).eq("id", a.id); loadAll(); };
+
   if (status === "loading") return <div className="center">Loading the trip…</div>;
   if (status === "error") return <div className="center">Couldn't reach the trip. Check your Supabase URL/key in <code>.env</code> and that the schema + migration ran.</div>;
   if (status === "needsMe") return (
@@ -123,7 +164,7 @@ export default function App() {
   const myMustCount = mustDos.filter((x) => x.member_id === meId).length;
   const limit = me ? me.must_do_limit : null;
   const dad = members.find((m) => m.role === "arbiter");
-  const cardProps = { me, members, ratings, mustDos, myMustCount, limit, days, on: { want: setWant, must: toggleMust, done: toggleDone, maybe: toMaybe, schedule, setPhase, del, rename } };
+  const cardProps = { me, members, ratings, mustDos, myMustCount, limit, days, on: { want: setWant, must: toggleMust, done: toggleDone, maybe: toMaybe, schedule, setPhase, del, rename, lock: toggleLock, moveDay: moveToDay, reorder: reorderInDay } };
   const dayItems = (dayId) => acts.filter((a) => a.day_id === dayId && a.status === "scheduled").sort((x, y) => (x.done - y.done) || ((x.start_time || "99") < (y.start_time || "99") ? -1 : x.sort - y.sort));
   const rankScore = (a) => (groupAvg(a, ratings) || 0) + mustWeight(a, mustDos, members);
 
@@ -174,7 +215,7 @@ export default function App() {
         <button className="addbtn" onClick={() => setSheet({ mode: "wishlist" })}>+ Add activity</button>
 
         {maybe.length > 0 && <>
-          <div className="section-label">Maybe later · parked</div>
+          <div className="section-label">Maybe later · parked / didn't fit</div>
           {maybe.map((a) => <ActivityCard key={a.id} a={a} context="maybe" accent={ac(a.region)} {...cardProps} />)}
         </>}
       </main>
@@ -193,8 +234,12 @@ export default function App() {
       <main className="wrap">
         <WeatherStrip weather={weather} />
         {preTrip
-          ? <p className="introline">Step 2 — once activities are rated, build each day here. Tap ✨ on a day to pull in the top-rated picks that fit.</p>
+          ? <p className="introline">Step 2 — build the week from your rated activities, then drag, lock, and adjust. Tap ✨ on a single day for hand-picked suggestions instead.</p>
           : <div className="todaybanner mono">{banner}</div>}
+
+        <button className="buildbtn" onClick={runBuildItinerary} disabled={building}>{building ? "Building…" : "✨ Build itinerary from rated activities"}</button>
+        <div className="buildnote">Auto-arranges unlocked activities across the 8 days by rating, must-dos, phase, and driving. 🔒 Lock anything with a real booking so a rebuild leaves it alone.</div>
+        {buildMsg && <div className="buildmsg">{buildMsg}</div>}
 
         <button className="suggestbtn" onClick={() => setSheet({ mode: "suggest" })}>＋ Suggest something now</button>
         {proposed.length > 0 && <>
@@ -202,7 +247,7 @@ export default function App() {
           {proposed.map((a) => <ActivityCard key={a.id} a={a} context="suggest" accent={REGION["Island-wide"]} {...cardProps} />)}
         </>}
 
-        <div className="section-label">The week · tap ✨ to build a day from rated activities</div>
+        <div className="section-label">The week · ✨ build all, or suggest per day</div>
         {days.map((day) => {
           const items = dayItems(day.id); const A = ac(day.region); const open = plannerDay === day.id;
           const ph = dayPhase(day.sort);
@@ -219,7 +264,7 @@ export default function App() {
                 <span className="dayphase">{cap(ph)}</span>
               </div>
               {items.map((a) => <ActivityCard key={a.id} a={a} context="day" accent={A} {...cardProps} />)}
-              {items.length === 0 && <div className="emptyhint" style={{ margin: "2px 0 6px" }}>Empty — tap ✨ to pull in rated activities, or + Add.</div>}
+              {items.length === 0 && <div className="emptyhint" style={{ margin: "2px 0 6px" }}>Empty — ✨ Build itinerary, tap Suggest below, or + Add.</div>}
               <div className="dayactions">
                 <button className="addbtn slim" onClick={() => setSheet({ mode: "day", dayId: day.id, dayLabel: `${dow(day.date)} ${day.date.slice(8)}` })}>+ Add</button>
                 <button className={"planbtn" + (open ? " on" : "")} onClick={() => setPlannerDay(open ? null : day.id)}>✨ Suggest for this day</button>
@@ -327,8 +372,9 @@ function ActivityCard({ a, context, accent, me, members, ratings, mustDos, myMus
         <div className="acttitle">
           <div className="aname">{a.start_time && <span className="atime">{fmtTime(a.start_time)}</span>}{a.title}</div>
           {a.notes && <div className="anote">{a.notes}</div>}
-          {((!editPhase && a.phase) || mustCount > 0) && <div className="flags">
+          {((!editPhase && a.phase) || mustCount > 0 || (context === "day" && a.locked)) && <div className="flags">
             {!editPhase && a.phase && <span className="phasechip">{PHASE[a.phase] || a.phase}</span>}
+            {context === "day" && a.locked && <span className="lockchip">🔒 locked</span>}
             {mustCount > 0 && <span className="mustbadge">★ {mustCount}</span>}
           </div>}
         </div>
@@ -353,6 +399,13 @@ function ActivityCard({ a, context, accent, me, members, ratings, mustDos, myMus
           <span className="avgwrap"><span className="avgbar" style={{ width: (avg ? avg / 5 * 100 : 0) + "%" }} /></span>
           <span className="avgnum mono">{avg ? avg.toFixed(1) : "—"}</span>
         </div>
+      </div>}
+
+      {context === "day" && <div className="dayctl">
+        <button className={"lockbtn" + (a.locked ? " on" : "")} onClick={() => on.lock(a)} title={a.locked ? "Locked — a rebuild won't move it" : "Lock to this day/slot"}>{a.locked ? "🔒 Locked" : "🔓 Lock"}</button>
+        <button className="reordbtn" onClick={() => on.reorder(a, "up")} aria-label="move earlier">↑</button>
+        <button className="reordbtn" onClick={() => on.reorder(a, "down")} aria-label="move later">↓</button>
+        <select className="schedsel" value="" onChange={(e) => on.moveDay(a, e.target.value)}><option value="" disabled>Move to…</option>{days.map((d) => <option key={d.id} value={d.id}>{dow(d.date)} {d.date.slice(8)}{d.label ? ` — ${d.label.slice(0, 18)}` : ""}</option>)}</select>
       </div>}
 
       <div className="actbtns">
