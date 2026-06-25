@@ -179,7 +179,10 @@ export default function App() {
   };
   const draftDay = async (day, list) => { for (const a of list) await supabase.from("activities").update({ status: "scheduled", day_id: day.id }).eq("id", a.id); loadAll(); };
   const runBuildItinerary = async () => {
-    if (!confirm("Build the week from your rated activities?\n\nUnlocked items can move between days. Locked items stay where you pinned them.")) return;
+    const overrideNote = !everyoneFinished && isArbiter
+      ? `\n\nNote: ${waitingCount} of ${totalMembers} members haven't finished rating yet. Build anyway?`
+      : "";
+    if (!confirm(`Build the week from your rated activities?\n\nUnlocked items can move between days. Locked items stay where you pinned them.${overrideNote}`)) return;
     setBuilding(true);
     setBuildMsg(null);
     try {
@@ -244,6 +247,29 @@ export default function App() {
   const myMustCount = mustDos.filter((x) => x.member_id === meId).length;
   const limit = me ? me.must_do_limit : null;
   const dad = members.find((m) => m.role === "arbiter");
+  const isArbiter = me && dad ? me.id === dad.id : me?.role === "arbiter";
+  const votableActs = acts.filter((a) => a.status === "idea");
+  const votableCount = votableActs.length;
+  const totalMembers = members.length;
+  const votableIds = new Set(votableActs.map((a) => a.id));
+  const ratedIdeaIdsByMember = ratings.reduce((map, rating) => {
+    if (!votableIds.has(rating.activity_id)) return map;
+    if (!map.has(rating.member_id)) map.set(rating.member_id, new Set());
+    map.get(rating.member_id).add(rating.activity_id);
+    return map;
+  }, new Map());
+  const unfinishedMembers = votableCount === 0
+    ? []
+    : members.filter((member) => (ratedIdeaIdsByMember.get(member.id)?.size || 0) < votableCount);
+  const finishedCount = votableCount === 0 ? 0 : totalMembers - unfinishedMembers.length;
+  const waitingCount = totalMembers - finishedCount;
+  const everyoneFinished = votableCount > 0 && finishedCount === totalMembers;
+  const canBuildItinerary = votableCount > 0 && (everyoneFinished || isArbiter);
+  const buildGateStatus = votableCount === 0
+    ? "No activities to build yet"
+    : !everyoneFinished && !isArbiter
+      ? `Waiting on ${waitingCount} of ${totalMembers} to finish rating: ${unfinishedMembers.map((member) => member.name).join(", ")}`
+      : null;
   const cardProps = {
     me, members, ratings, mustDos, myMustCount, limit, days,
     on: {
@@ -333,9 +359,10 @@ export default function App() {
           : <div className="todaybanner mono">{banner}</div>}
 
         <button className="suggestbtn" onClick={() => setSheet({ mode: "suggest" })}>＋ Suggest something now</button>
-        <button className="buildbtn" onClick={runBuildItinerary} disabled={building}>
+        <button className="buildbtn" onClick={runBuildItinerary} disabled={building || !canBuildItinerary}>
           {building ? "Building..." : "Build itinerary from rated activities"}
         </button>
+        {buildGateStatus && <div className="buildnote">{buildGateStatus}</div>}
         <div className="buildnote">Unlocked activities can move when you rebuild. Lock pinned items first.</div>
         {buildMsg && <div className="buildmsg">{buildMsg}</div>}
 
