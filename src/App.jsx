@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef, useCallback } from "react";
 import { supabase } from "./supabaseClient.js";
 import { getWeather, wcode } from "./weather.js";
 import { driveTime } from "./data/geo.js";
+import { buildItinerary } from "./data/buildItinerary.js";
 
 const REGION = {
   "Christiansted": "#0E6E6E", "West End": "#C98A1E", "Rainforest & North Shore": "#3F8E5B",
@@ -52,6 +53,8 @@ export default function App() {
   const [sortMode, setSortMode] = useState("wanted"); // 'wanted' | 'when'
   const [sheet, setSheet] = useState(null);
   const [plannerDay, setPlannerDay] = useState(null);
+  const [building, setBuilding] = useState(false);
+  const [buildMsg, setBuildMsg] = useState(null);
   const reloadTimer = useRef(null);
   const wantTimers = useRef({});
 
@@ -175,6 +178,63 @@ export default function App() {
     await supabase.from("activities").insert(base); setSheet(null); loadAll();
   };
   const draftDay = async (day, list) => { for (const a of list) await supabase.from("activities").update({ status: "scheduled", day_id: day.id }).eq("id", a.id); loadAll(); };
+  const runBuildItinerary = async () => {
+    if (!confirm("Build the week from your rated activities?\n\nUnlocked items can move between days. Locked items stay where you pinned them.")) return;
+    setBuilding(true);
+    setBuildMsg(null);
+    try {
+      const { assignments, didNotFit } = buildItinerary({ activities: acts, days, ratings, mustDos, members });
+      for (const assignment of assignments) {
+        if (assignment.locked) continue;
+        await supabase.from("activities").update({
+          day_id: assignment.day_id,
+          status: "scheduled",
+          start_time: assignment.start_time,
+          sort: assignment.sort
+        }).eq("id", assignment.id);
+      }
+      for (const id of didNotFit) {
+        await supabase.from("activities").update({
+          status: "maybe_later",
+          day_id: null,
+          start_time: null
+        }).eq("id", id);
+      }
+      const placed = assignments.filter((assignment) => !assignment.locked).length;
+      setBuildMsg(`Built ${placed} ${placed === 1 ? "activity" : "activities"} into days. ${didNotFit.length} moved to Maybe later.`);
+      await loadAll();
+    } finally {
+      setBuilding(false);
+    }
+  };
+  const moveToDay = async (a, dayId) => {
+    if (!dayId || dayId === a.day_id) return;
+    const target = acts.filter((x) => x.day_id === dayId && x.status === "scheduled");
+    const maxSort = target.length ? Math.max(...target.map((x) => x.sort || 0)) : -1;
+    await supabase.from("activities").update({
+      day_id: dayId,
+      status: "scheduled",
+      sort: maxSort + 1,
+      locked: true
+    }).eq("id", a.id);
+    loadAll();
+  };
+  const reorderInDay = async (a, dir) => {
+    const list = acts
+      .filter((x) => x.day_id === a.day_id && x.status === "scheduled")
+      .sort((x, y) => (x.sort || 0) - (y.sort || 0));
+    const i = list.findIndex((x) => x.id === a.id);
+    const j = dir === "up" ? i - 1 : i + 1;
+    if (i < 0 || j < 0 || j >= list.length) return;
+    const other = list[j];
+    await supabase.from("activities").update({ sort: other.sort || 0, locked: true }).eq("id", a.id);
+    await supabase.from("activities").update({ sort: a.sort || 0 }).eq("id", other.id);
+    loadAll();
+  };
+  const toggleLock = async (a) => {
+    await supabase.from("activities").update({ locked: !a.locked }).eq("id", a.id);
+    loadAll();
+  };
 
   if (status === "loading") return <div className="center">Loading the trip…</div>;
   if (status === "error") return <div className="center">Couldn't reach the trip. Check your Supabase URL/key in <code>.env</code> and that the schema + migration ran.</div>;
@@ -184,7 +244,22 @@ export default function App() {
   const myMustCount = mustDos.filter((x) => x.member_id === meId).length;
   const limit = me ? me.must_do_limit : null;
   const dad = members.find((m) => m.role === "arbiter");
-  const cardProps = { me, members, ratings, mustDos, myMustCount, limit, days, on: { want: setWant, must: toggleMust, done: toggleDone, maybe: toMaybe, schedule, setPhase, del, rename } };
+  const cardProps = {
+    me, members, ratings, mustDos, myMustCount, limit, days,
+    on: {
+      want: setWant,
+      must: toggleMust,
+      done: toggleDone,
+      maybe: toMaybe,
+      schedule,
+      setPhase,
+      del,
+      rename,
+      lock: toggleLock,
+      moveDay: moveToDay,
+      reorder: reorderInDay
+    }
+  };
   const dayItems = (dayId) => acts.filter((a) => a.day_id === dayId && a.status === "scheduled").sort((x, y) => (x.done - y.done) || ((x.start_time || "99") < (y.start_time || "99") ? -1 : x.sort - y.sort));
   const rankScore = (a) => (groupAvg(a, ratings) || 0) + mustWeight(a, mustDos, members);
 
@@ -258,6 +333,12 @@ export default function App() {
           : <div className="todaybanner mono">{banner}</div>}
 
         <button className="suggestbtn" onClick={() => setSheet({ mode: "suggest" })}>＋ Suggest something now</button>
+        <button className="buildbtn" onClick={runBuildItinerary} disabled={building}>
+          {building ? "Building..." : "Build itinerary from rated activities"}
+        </button>
+        <div className="buildnote">Unlocked activities can move when you rebuild. Lock pinned items first.</div>
+        {buildMsg && <div className="buildmsg">{buildMsg}</div>}
+
         {proposed.length > 0 && <>
           <div className="section-label coral">Suggested now · react and slot it in</div>
           {proposed.map((a) => <ActivityCard key={a.id} a={a} context="suggest" accent={REGION["Island-wide"]} {...cardProps} />)}
@@ -463,8 +544,9 @@ function ActivityCard({ a, context, accent, me, members, ratings, mustDos, myMus
         <div className="acttitle">
           <div className="aname">{a.start_time && <span className="atime">{fmtTime(a.start_time)}</span>}{a.title}</div>
           {a.notes && <div className="anote">{a.notes}</div>}
-          {((!editPhase && a.phase) || mustCount > 0) && <div className="flags">
+          {((!editPhase && a.phase) || mustCount > 0 || (context === "day" && a.locked)) && <div className="flags">
             {!editPhase && a.phase && <span className="phasechip">{PHASE[a.phase] || a.phase}</span>}
+            {context === "day" && a.locked && <span className="lockchip">locked</span>}
             {mustCount > 0 && <span className="mustbadge">★ {mustCount}</span>}
           </div>}
         </div>
@@ -489,6 +571,18 @@ function ActivityCard({ a, context, accent, me, members, ratings, mustDos, myMus
           <span className="avgwrap"><span className="avgbar" style={{ width: (avg ? avg / 5 * 100 : 0) + "%" }} /></span>
           <span className="avgnum mono">{avg ? avg.toFixed(1) : "—"}</span>
         </div>
+      </div>}
+
+      {context === "day" && <div className="dayctl">
+        <button className={"lockbtn" + (a.locked ? " on" : "")} onClick={() => on.lock(a)} title={a.locked ? "Locked - a rebuild will not move it" : "Lock to this day and slot"}>
+          {a.locked ? "Locked" : "Lock"}
+        </button>
+        <button className="reordbtn" onClick={() => on.reorder(a, "up")} aria-label="move earlier">Up</button>
+        <button className="reordbtn" onClick={() => on.reorder(a, "down")} aria-label="move later">Down</button>
+        <select className="schedsel" value="" onChange={(e) => on.moveDay(a, e.target.value)}>
+          <option value="" disabled>Move to...</option>
+          {days.map((d) => <option key={d.id} value={d.id}>{dow(d.date)} {d.date.slice(8)}{d.label ? ` â€” ${d.label.slice(0, 18)}` : ""}</option>)}
+        </select>
       </div>}
 
       <div className="actbtns">

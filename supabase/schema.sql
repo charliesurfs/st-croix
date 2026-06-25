@@ -48,6 +48,7 @@ create table if not exists activities (
   status text not null default 'scheduled', -- idea | proposed | scheduled | maybe_later | dropped
   done boolean default false,               -- checked off (separate from status)
   phase text,                               -- 'early' | 'mid' | 'late' | null
+  locked boolean not null default false,    -- pinned to its day/slot by the builder UI
   notes text,
   sort int default 0,
   created_by uuid references members(id) on delete set null,
