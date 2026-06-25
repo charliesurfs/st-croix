@@ -13,6 +13,7 @@ const ME_KEY = "stx_me";
 const RLABELS = ["Don't want", "Eh", "Maybe", "Want to", "Really want"];
 const PHASE = { early: "early trip", mid: "mid trip", late: "late trip" };
 const DAY_BUDGET = 540; // ~9 hrs of daytime activity
+const PIN_RE = /^\d{4,6}$/;
 const fmtTime = (t) => { if (!t) return ""; const [h, m] = t.split(":").map(Number); return `${((h + 11) % 12) + 1}:${String(m).padStart(2, "0")} ${h < 12 ? "AM" : "PM"}`; };
 const dow = (d) => d ? ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"][new Date(d + "T12:00").getDay()] : "";
 const todayStr = () => { const t = new Date(); return `${t.getFullYear()}-${String(t.getMonth() + 1).padStart(2, "0")}-${String(t.getDate()).padStart(2, "0")}`; };
@@ -30,6 +31,12 @@ const groupAvg = (a, ratings) => {
   const rs = ratings.filter((r) => r.activity_id === a.id);
   return rs.length ? rs.reduce((s, r) => s + r.want, 0) / rs.length : null;
 };
+const hasClaimedPin = (m) => Boolean(m && m.claimed && m.pin_hash);
+const needsClaimPin = (m) => Boolean(m && !hasClaimedPin(m));
+const hashPin = async (pin) => {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(pin));
+  return Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, "0")).join("");
+};
 
 export default function App() {
   const [trip, setTrip] = useState(null);
@@ -40,6 +47,7 @@ export default function App() {
   const [mustDos, setMustDos] = useState([]);
   const [meId, setMeId] = useState(() => localStorage.getItem(ME_KEY) || null);
   const [status, setStatus] = useState("loading");
+  const [gate, setGate] = useState({ mode: "grid", memberId: null });
   const [weather, setWeather] = useState(null);
   const [view, setView] = useState("activities");   // 'activities' (Stage 1) | 'itinerary' (Stage 2 + live)
   const [sortMode, setSortMode] = useState("wanted"); // 'wanted' | 'when'
@@ -62,9 +70,32 @@ export default function App() {
       supabase.from("ratings").select("*"),
       supabase.from("must_dos").select("*")
     ]);
-    setTrip(t); setMembers(m.data || []); setDays(d.data || []);
+    const nextMembers = m.data || [];
+    setTrip(t); setMembers(nextMembers); setDays(d.data || []);
     setActs(a.data || []); setRatings(r.data || []); setMustDos(md.data || []);
-    setStatus((m.data || []).some((x) => x.id === localStorage.getItem(ME_KEY)) ? "ready" : "needsMe");
+    const storedId = localStorage.getItem(ME_KEY);
+    const storedMember = nextMembers.find((x) => x.id === storedId) || null;
+    if (storedMember) {
+      setMeId(storedMember.id);
+      if (needsClaimPin(storedMember)) {
+        setGate({ mode: "claim", memberId: storedMember.id });
+        setStatus("needsMe");
+      } else {
+        setGate({ mode: "grid", memberId: null });
+        setStatus("ready");
+      }
+      return;
+    }
+    setMeId(null);
+    setStatus("needsMe");
+    setGate((prev) => {
+      if (!prev.memberId) return { mode: "grid", memberId: null };
+      const selected = nextMembers.find((x) => x.id === prev.memberId);
+      if (!selected) return { mode: "grid", memberId: null };
+      if (prev.mode === "claim") return needsClaimPin(selected) ? prev : { mode: "pin", memberId: selected.id };
+      if (prev.mode === "pin") return needsClaimPin(selected) ? { mode: "claim", memberId: selected.id } : prev;
+      return prev;
+    });
   }, []);
 
   useEffect(() => { loadAll(); }, [loadAll]);
@@ -75,13 +106,48 @@ export default function App() {
       .on("postgres_changes", { event: "*", schema: "public", table: "ratings" }, reload)
       .on("postgres_changes", { event: "*", schema: "public", table: "must_dos" }, reload)
       .on("postgres_changes", { event: "*", schema: "public", table: "days" }, reload)
+      .on("postgres_changes", { event: "*", schema: "public", table: "members" }, reload)
       .subscribe();
     return () => { supabase.removeChannel(ch); };
   }, [loadAll]);
   useEffect(() => { getWeather().then(setWeather).catch(() => setWeather("err")); }, []);
 
   const me = members.find((x) => x.id === meId) || null;
-  const pickMe = (id) => { localStorage.setItem(ME_KEY, id); setMeId(id); setStatus("ready"); };
+  const enterAppAs = (id) => {
+    localStorage.setItem(ME_KEY, id);
+    setMeId(id);
+    setGate({ mode: "grid", memberId: null });
+    setStatus("ready");
+  };
+  const resetIdentity = () => {
+    localStorage.removeItem(ME_KEY);
+    setMeId(null);
+    setGate({ mode: "grid", memberId: null });
+    setStatus("needsMe");
+  };
+  const chooseMember = (member) => { setGate({ mode: hasClaimedPin(member) ? "pin" : "claim", memberId: member.id }); };
+  const claimMember = async (member, pin) => {
+    const pin_hash = await hashPin(pin);
+    const { data, error } = await supabase
+      .from("members")
+      .update({ pin_hash, claimed: true })
+      .eq("id", member.id)
+      .eq("claimed", false)
+      .select("*");
+    if (error) throw error;
+    const row = data && data[0];
+    if (!row) {
+      await loadAll();
+      throw new Error("That name was just claimed on another device. Enter the PIN to continue.");
+    }
+    setMembers((prev) => prev.map((x) => (x.id === member.id ? { ...x, ...row } : x)));
+    enterAppAs(member.id);
+  };
+  const verifyMemberPin = async (member, pin) => {
+    const pin_hash = await hashPin(pin);
+    if (pin_hash !== member.pin_hash) throw new Error("Wrong PIN.");
+    enterAppAs(member.id);
+  };
 
   // mutations
   const setWant = (a, val) => {
@@ -112,59 +178,88 @@ export default function App() {
     await supabase.from("activities").insert(base); setSheet(null); loadAll();
   };
   const draftDay = async (day, list) => { for (const a of list) await supabase.from("activities").update({ status: "scheduled", day_id: day.id }).eq("id", a.id); loadAll(); };
-
-  // ---- Stage 2: auto-build (B1) + manual move / lock (B4) ----
   const runBuildItinerary = async () => {
-    if (!confirm("Auto-build the week from the rated activities?\n\nThis re-arranges all UNLOCKED items into days. Locked items (your manual placements + anchors) stay put. Times are rough morning/afternoon/evening suggestions — pin real bookings by locking them.")) return;
-    setBuilding(true); setBuildMsg(null);
-    const { assignments, didNotFit } = buildItinerary({ activities: acts, days, ratings, mustDos, members });
-    for (const as of assignments) {
-      if (as.locked) continue; // never touch locked items
-      await supabase.from("activities").update({ day_id: as.day_id, status: "scheduled", start_time: as.start_time, sort: as.sort }).eq("id", as.id);
+    if (!confirm("Build the week from your rated activities?\n\nUnlocked items can move between days. Locked items stay where you pinned them.")) return;
+    setBuilding(true);
+    setBuildMsg(null);
+    try {
+      const { assignments, didNotFit } = buildItinerary({ activities: acts, days, ratings, mustDos, members });
+      for (const assignment of assignments) {
+        if (assignment.locked) continue;
+        await supabase.from("activities").update({
+          day_id: assignment.day_id,
+          status: "scheduled",
+          start_time: assignment.start_time,
+          sort: assignment.sort
+        }).eq("id", assignment.id);
+      }
+      for (const id of didNotFit) {
+        await supabase.from("activities").update({
+          status: "maybe_later",
+          day_id: null,
+          start_time: null
+        }).eq("id", id);
+      }
+      const placed = assignments.filter((assignment) => !assignment.locked).length;
+      setBuildMsg(`Built ${placed} ${placed === 1 ? "activity" : "activities"} into days. ${didNotFit.length} moved to Maybe later.`);
+      await loadAll();
+    } finally {
+      setBuilding(false);
     }
-    for (const id of didNotFit) {
-      await supabase.from("activities").update({ status: "maybe_later", day_id: null, start_time: null }).eq("id", id);
-    }
-    const placed = assignments.filter((a) => !a.locked).length;
-    setBuilding(false);
-    setBuildMsg(`Built ${placed} ${placed === 1 ? "activity" : "activities"} into days. ${didNotFit.length} didn't fit — find them under “Maybe later” in Activities. Times are rough; lock anything with a real booking.`);
-    loadAll();
   };
-  // Manual move to another day -> pins (locks) the item so a rebuild won't move it.
   const moveToDay = async (a, dayId) => {
     if (!dayId || dayId === a.day_id) return;
     const target = acts.filter((x) => x.day_id === dayId && x.status === "scheduled");
     const maxSort = target.length ? Math.max(...target.map((x) => x.sort || 0)) : -1;
-    await supabase.from("activities").update({ day_id: dayId, status: "scheduled", sort: maxSort + 1, locked: true }).eq("id", a.id);
+    await supabase.from("activities").update({
+      day_id: dayId,
+      status: "scheduled",
+      sort: maxSort + 1,
+      locked: true
+    }).eq("id", a.id);
     loadAll();
   };
-  // Reorder within a day (swap sort with neighbour) -> pins the moved item.
   const reorderInDay = async (a, dir) => {
-    const list = acts.filter((x) => x.day_id === a.day_id && x.status === "scheduled").sort((x, y) => (x.sort || 0) - (y.sort || 0));
+    const list = acts
+      .filter((x) => x.day_id === a.day_id && x.status === "scheduled")
+      .sort((x, y) => (x.sort || 0) - (y.sort || 0));
     const i = list.findIndex((x) => x.id === a.id);
     const j = dir === "up" ? i - 1 : i + 1;
     if (i < 0 || j < 0 || j >= list.length) return;
-    const b = list[j];
-    await supabase.from("activities").update({ sort: b.sort || 0, locked: true }).eq("id", a.id);
-    await supabase.from("activities").update({ sort: a.sort || 0 }).eq("id", b.id);
+    const other = list[j];
+    await supabase.from("activities").update({ sort: other.sort || 0, locked: true }).eq("id", a.id);
+    await supabase.from("activities").update({ sort: a.sort || 0 }).eq("id", other.id);
     loadAll();
   };
-  const toggleLock = async (a) => { await supabase.from("activities").update({ locked: !a.locked }).eq("id", a.id); loadAll(); };
+  const toggleLock = async (a) => {
+    await supabase.from("activities").update({ locked: !a.locked }).eq("id", a.id);
+    loadAll();
+  };
 
   if (status === "loading") return <div className="center">Loading the trip…</div>;
   if (status === "error") return <div className="center">Couldn't reach the trip. Check your Supabase URL/key in <code>.env</code> and that the schema + migration ran.</div>;
-  if (status === "needsMe") return (
-    <div className="gate"><div className="gatecard">
-      <h2 className="display">Who are you?</h2>
-      <p>Pick yourself so your ratings and must-dos are tagged to you. Adds stay anonymous.</p>
-      {members.map((m) => <button key={m.id} className="gatebtn" onClick={() => pickMe(m.id)}><span className="mswatch" style={{ background: m.color }} />{m.name}{m.role === "arbiter" ? " · final say" : ""}</button>)}
-    </div></div>
-  );
+  if (status === "needsMe") return <IdentityGate members={members} gate={gate} onChooseMember={chooseMember} onClaimPin={claimMember} onEnterPin={verifyMemberPin} onBack={resetIdentity} />;
+  if (!me) return <div className="center">Refreshing your trip seat...</div>;
 
   const myMustCount = mustDos.filter((x) => x.member_id === meId).length;
   const limit = me ? me.must_do_limit : null;
   const dad = members.find((m) => m.role === "arbiter");
-  const cardProps = { me, members, ratings, mustDos, myMustCount, limit, days, on: { want: setWant, must: toggleMust, done: toggleDone, maybe: toMaybe, schedule, setPhase, del, rename, lock: toggleLock, moveDay: moveToDay, reorder: reorderInDay } };
+  const cardProps = {
+    me, members, ratings, mustDos, myMustCount, limit, days,
+    on: {
+      want: setWant,
+      must: toggleMust,
+      done: toggleDone,
+      maybe: toMaybe,
+      schedule,
+      setPhase,
+      del,
+      rename,
+      lock: toggleLock,
+      moveDay: moveToDay,
+      reorder: reorderInDay
+    }
+  };
   const dayItems = (dayId) => acts.filter((a) => a.day_id === dayId && a.status === "scheduled").sort((x, y) => (x.done - y.done) || ((x.start_time || "99") < (y.start_time || "99") ? -1 : x.sort - y.sort));
   const rankScore = (a) => (groupAvg(a, ratings) || 0) + mustWeight(a, mustDos, members);
 
@@ -215,7 +310,7 @@ export default function App() {
         <button className="addbtn" onClick={() => setSheet({ mode: "wishlist" })}>+ Add activity</button>
 
         {maybe.length > 0 && <>
-          <div className="section-label">Maybe later · parked / didn't fit</div>
+          <div className="section-label">Maybe later · parked</div>
           {maybe.map((a) => <ActivityCard key={a.id} a={a} context="maybe" accent={ac(a.region)} {...cardProps} />)}
         </>}
       </main>
@@ -234,20 +329,22 @@ export default function App() {
       <main className="wrap">
         <WeatherStrip weather={weather} />
         {preTrip
-          ? <p className="introline">Step 2 — build the week from your rated activities, then drag, lock, and adjust. Tap ✨ on a single day for hand-picked suggestions instead.</p>
+          ? <p className="introline">Step 2 — once activities are rated, build each day here. Tap ✨ on a day to pull in the top-rated picks that fit.</p>
           : <div className="todaybanner mono">{banner}</div>}
 
-        <button className="buildbtn" onClick={runBuildItinerary} disabled={building}>{building ? "Building…" : "✨ Build itinerary from rated activities"}</button>
-        <div className="buildnote">Auto-arranges unlocked activities across the 8 days by rating, must-dos, phase, and driving. 🔒 Lock anything with a real booking so a rebuild leaves it alone.</div>
+        <button className="suggestbtn" onClick={() => setSheet({ mode: "suggest" })}>＋ Suggest something now</button>
+        <button className="buildbtn" onClick={runBuildItinerary} disabled={building}>
+          {building ? "Building..." : "Build itinerary from rated activities"}
+        </button>
+        <div className="buildnote">Unlocked activities can move when you rebuild. Lock pinned items first.</div>
         {buildMsg && <div className="buildmsg">{buildMsg}</div>}
 
-        <button className="suggestbtn" onClick={() => setSheet({ mode: "suggest" })}>＋ Suggest something now</button>
         {proposed.length > 0 && <>
           <div className="section-label coral">Suggested now · react and slot it in</div>
           {proposed.map((a) => <ActivityCard key={a.id} a={a} context="suggest" accent={REGION["Island-wide"]} {...cardProps} />)}
         </>}
 
-        <div className="section-label">The week · ✨ build all, or suggest per day</div>
+        <div className="section-label">The week · tap ✨ to build a day from rated activities</div>
         {days.map((day) => {
           const items = dayItems(day.id); const A = ac(day.region); const open = plannerDay === day.id;
           const ph = dayPhase(day.sort);
@@ -264,7 +361,7 @@ export default function App() {
                 <span className="dayphase">{cap(ph)}</span>
               </div>
               {items.map((a) => <ActivityCard key={a.id} a={a} context="day" accent={A} {...cardProps} />)}
-              {items.length === 0 && <div className="emptyhint" style={{ margin: "2px 0 6px" }}>Empty — ✨ Build itinerary, tap Suggest below, or + Add.</div>}
+              {items.length === 0 && <div className="emptyhint" style={{ margin: "2px 0 6px" }}>Empty — tap ✨ to pull in rated activities, or + Add.</div>}
               <div className="dayactions">
                 <button className="addbtn slim" onClick={() => setSheet({ mode: "day", dayId: day.id, dayLabel: `${dow(day.date)} ${day.date.slice(8)}` })}>+ Add</button>
                 <button className={"planbtn" + (open ? " on" : "")} onClick={() => setPlannerDay(open ? null : day.id)}>✨ Suggest for this day</button>
@@ -284,7 +381,7 @@ export default function App() {
           <div><div className="eyebrow">U.S. Virgin Islands</div><h1 className="display">{trip.name}</h1><div className="dates mono">Aug 19–26, 2026</div></div>
           <div style={{ textAlign: "right", display: "flex", flexDirection: "column", gap: 8, alignItems: "flex-end" }}>
             <span className="sync"><span className="d" /> live</span>
-            <button className="mebtn" onClick={() => { localStorage.removeItem(ME_KEY); setMeId(null); setStatus("needsMe"); }}>I'm {me.name} ▾</button>
+            <button className="mebtn" onClick={resetIdentity}>I'm {me.name} ▾</button>
           </div>
         </div>
       </div></header>
@@ -298,6 +395,81 @@ export default function App() {
 
       {sheet && <AddSheet sheet={sheet} onClose={() => setSheet(null)} onAdd={addActivity} />}
     </div>
+  );
+}
+
+function IdentityGate({ members, gate, onChooseMember, onClaimPin, onEnterPin, onBack }) {
+  const member = members.find((x) => x.id === gate.memberId) || null;
+  const [pin, setPin] = useState("");
+  const [confirmPin, setConfirmPin] = useState("");
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    setPin("");
+    setConfirmPin("");
+    setError("");
+    setBusy(false);
+  }, [gate.mode, gate.memberId]);
+
+  const changePin = (value, setter) => setter(value.replace(/\D/g, "").slice(0, 6));
+  const submitClaim = async () => {
+    if (!member) return;
+    if (!PIN_RE.test(pin)) { setError("Use a 4-6 digit PIN."); return; }
+    if (pin !== confirmPin) { setError("PINs don't match yet."); return; }
+    setBusy(true);
+    setError("");
+    try { await onClaimPin(member, pin); }
+    catch (err) { setError(err.message || "Couldn't save that PIN."); setBusy(false); }
+  };
+  const submitPin = async () => {
+    if (!member) return;
+    if (!PIN_RE.test(pin)) { setError("Enter your 4-6 digit PIN."); return; }
+    setBusy(true);
+    setError("");
+    try { await onEnterPin(member, pin); }
+    catch (err) { setError(err.message || "Wrong PIN."); setBusy(false); }
+  };
+
+  if ((gate.mode === "claim" || gate.mode === "pin") && member) {
+    const claiming = gate.mode === "claim";
+    // Forgotten PINs are reset manually for this trusted family app:
+    // clear pin_hash and set claimed=false in the Supabase Table Editor.
+    return (
+      <div className="gate"><div className="gatecard">
+        <div className="gatewho"><span className="mswatch" style={{ background: member.color }} />{member.name}{member.role === "arbiter" ? <span className="gaterolepill">final say</span> : null}</div>
+        <h2 className="display">{claiming ? "Set a PIN" : "Enter PIN"}</h2>
+        <p>{claiming ? "Claim your name once with a short PIN. After that, other devices need the PIN, but this phone remembers you." : "That name is already claimed. Enter the short PIN to use it on this device."}</p>
+        <div className="gatefield">
+          <label className="gatelabel" htmlFor="gate-pin">PIN</label>
+          <input id="gate-pin" className="gateinput" type="password" inputMode="numeric" pattern="\d*" autoComplete={claiming ? "new-password" : "current-password"} maxLength={6} value={pin} onChange={(e) => changePin(e.target.value, setPin)} onKeyDown={(e) => { if (e.key === "Enter") claiming ? submitClaim() : submitPin(); }} />
+        </div>
+        {claiming && <div className="gatefield">
+          <label className="gatelabel" htmlFor="gate-pin-confirm">Confirm PIN</label>
+          <input id="gate-pin-confirm" className="gateinput" type="password" inputMode="numeric" pattern="\d*" autoComplete="new-password" maxLength={6} value={confirmPin} onChange={(e) => changePin(e.target.value, setConfirmPin)} onKeyDown={(e) => { if (e.key === "Enter") submitClaim(); }} />
+        </div>}
+        {error && <div className="gateerror">{error}</div>}
+        <button className="gatecta" onClick={claiming ? submitClaim : submitPin} disabled={busy}>{busy ? (claiming ? "Saving..." : "Checking...") : (claiming ? "Claim this name" : "Log in")}</button>
+        <button className="gateback" onClick={onBack} disabled={busy}>Back to names</button>
+      </div></div>
+    );
+  }
+
+  return (
+    <div className="gate"><div className="gatecard">
+      <h2 className="display">Who are you?</h2>
+      <p>Claim your name once with a short PIN. After that, this phone remembers you and other devices need the PIN.</p>
+      <div className="gategrid">
+        {members.map((m) => <button key={m.id} className="gatebtn gatecell" onClick={() => onChooseMember(m)}>
+          <span className="gatecelltop">
+            <span className="mswatch" style={{ background: m.color }} />
+            <span className="gatename">{m.name}</span>
+            {m.claimed && <span className="gatelock" aria-hidden="true" title="Claimed" />}
+          </span>
+          <span className="gatesub">{m.role === "arbiter" ? "final say" : m.claimed ? "PIN on new devices" : "tap to claim"}</span>
+        </button>)}
+      </div>
+    </div></div>
   );
 }
 
@@ -374,7 +546,7 @@ function ActivityCard({ a, context, accent, me, members, ratings, mustDos, myMus
           {a.notes && <div className="anote">{a.notes}</div>}
           {((!editPhase && a.phase) || mustCount > 0 || (context === "day" && a.locked)) && <div className="flags">
             {!editPhase && a.phase && <span className="phasechip">{PHASE[a.phase] || a.phase}</span>}
-            {context === "day" && a.locked && <span className="lockchip">🔒 locked</span>}
+            {context === "day" && a.locked && <span className="lockchip">locked</span>}
             {mustCount > 0 && <span className="mustbadge">★ {mustCount}</span>}
           </div>}
         </div>
@@ -402,10 +574,15 @@ function ActivityCard({ a, context, accent, me, members, ratings, mustDos, myMus
       </div>}
 
       {context === "day" && <div className="dayctl">
-        <button className={"lockbtn" + (a.locked ? " on" : "")} onClick={() => on.lock(a)} title={a.locked ? "Locked — a rebuild won't move it" : "Lock to this day/slot"}>{a.locked ? "🔒 Locked" : "🔓 Lock"}</button>
-        <button className="reordbtn" onClick={() => on.reorder(a, "up")} aria-label="move earlier">↑</button>
-        <button className="reordbtn" onClick={() => on.reorder(a, "down")} aria-label="move later">↓</button>
-        <select className="schedsel" value="" onChange={(e) => on.moveDay(a, e.target.value)}><option value="" disabled>Move to…</option>{days.map((d) => <option key={d.id} value={d.id}>{dow(d.date)} {d.date.slice(8)}{d.label ? ` — ${d.label.slice(0, 18)}` : ""}</option>)}</select>
+        <button className={"lockbtn" + (a.locked ? " on" : "")} onClick={() => on.lock(a)} title={a.locked ? "Locked - a rebuild will not move it" : "Lock to this day and slot"}>
+          {a.locked ? "Locked" : "Lock"}
+        </button>
+        <button className="reordbtn" onClick={() => on.reorder(a, "up")} aria-label="move earlier">Up</button>
+        <button className="reordbtn" onClick={() => on.reorder(a, "down")} aria-label="move later">Down</button>
+        <select className="schedsel" value="" onChange={(e) => on.moveDay(a, e.target.value)}>
+          <option value="" disabled>Move to...</option>
+          {days.map((d) => <option key={d.id} value={d.id}>{dow(d.date)} {d.date.slice(8)}{d.label ? ` â€” ${d.label.slice(0, 18)}` : ""}</option>)}
+        </select>
       </div>}
 
       <div className="actbtns">
