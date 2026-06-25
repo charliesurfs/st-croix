@@ -1,8 +1,7 @@
 import React, { useState, useEffect, useRef, useCallback } from "react";
 import { supabase } from "./supabaseClient.js";
 import { getWeather, wcode } from "./weather.js";
-import { driveTime } from "./data/geo.js";
-import { buildItinerary } from "./data/buildItinerary.js";
+import { buildItinerary, optimizeItinerary, rerollItinerary } from "./data/buildItinerary.js";
 
 const REGION = {
   "Christiansted": "#0E6E6E", "West End": "#C98A1E", "Rainforest & North Shore": "#3F8E5B",
@@ -68,8 +67,13 @@ export default function App() {
   const [plannerDay, setPlannerDay] = useState(null);
   const [building, setBuilding] = useState(false);
   const [buildMsg, setBuildMsg] = useState(null);
+  const [proposal, setProposal] = useState(null);
+  const [shuffleBusy, setShuffleBusy] = useState("");
+  const [applyingProposal, setApplyingProposal] = useState(false);
   const reloadTimer = useRef(null);
   const wantTimers = useRef({});
+  const shuffleSeed = useRef(Math.floor(Date.now() % 1000000) || 1);
+  const proposalRef = useRef(null);
 
   const loadAll = useCallback(async () => {
     const { data: trips, error } = await supabase.from("trips").select("*").limit(1);
@@ -126,6 +130,12 @@ export default function App() {
     return () => { supabase.removeChannel(ch); };
   }, [loadAll]);
   useEffect(() => { getWeather().then(setWeather).catch(() => setWeather("err")); }, []);
+  useEffect(() => { proposalRef.current = proposal; }, [proposal]);
+  useEffect(() => {
+    if (!proposalRef.current) return;
+    setProposal(null);
+    setPlannerDay(null);
+  }, [acts, days, ratings, mustDos]);
 
   const me = members.find((x) => x.id === meId) || null;
   const enterAppAs = (id) => {
@@ -199,6 +209,26 @@ export default function App() {
     if (error) throw error;
     loadAll();
   };
+  const commitArrangement = async ({ assignments, didNotFit, message }) => {
+    for (const assignment of assignments) {
+      if (assignment.locked) continue;
+      await supabase.from("activities").update({
+        day_id: assignment.day_id,
+        status: "scheduled",
+        start_time: assignment.start_time,
+        sort: assignment.sort
+      }).eq("id", assignment.id);
+    }
+    for (const id of didNotFit) {
+      await supabase.from("activities").update({
+        status: "maybe_later",
+        day_id: null,
+        start_time: null
+      }).eq("id", id);
+    }
+    setBuildMsg(message);
+    await loadAll();
+  };
   const runBuildItinerary = async () => {
     const overrideNote = !everyoneFinished && isArbiter
       ? `\n\nNote: ${waitingCount} of ${totalMembers} members haven't finished rating yet. Build anyway?`
@@ -206,29 +236,65 @@ export default function App() {
     if (!confirm(`Build the week from your rated activities?\n\nUnlocked items can move between days. Locked items stay where you pinned them.${overrideNote}`)) return;
     setBuilding(true);
     setBuildMsg(null);
+    setProposal(null);
     try {
       const { assignments, didNotFit } = buildItinerary({ activities: acts, days, ratings, mustDos, members });
-      for (const assignment of assignments) {
-        if (assignment.locked) continue;
-        await supabase.from("activities").update({
-          day_id: assignment.day_id,
-          status: "scheduled",
-          start_time: assignment.start_time,
-          sort: assignment.sort
-        }).eq("id", assignment.id);
-      }
-      for (const id of didNotFit) {
-        await supabase.from("activities").update({
-          status: "maybe_later",
-          day_id: null,
-          start_time: null
-        }).eq("id", id);
-      }
       const placed = assignments.filter((assignment) => !assignment.locked).length;
-      setBuildMsg(`Built ${placed} ${placed === 1 ? "activity" : "activities"} into days. ${didNotFit.length} moved to Maybe later.`);
-      await loadAll();
+      await commitArrangement({
+        assignments,
+        didNotFit,
+        message: `Built ${placed} ${placed === 1 ? "activity" : "activities"} into days. ${didNotFit.length} moved to Maybe later.`
+      });
     } finally {
       setBuilding(false);
+    }
+  };
+  const proposeArrangement = (mode) => {
+    if (!canBuildItinerary || shuffleBusy || building || applyingProposal) return;
+    setShuffleBusy(mode);
+    setBuildMsg(null);
+    setPlannerDay(null);
+    try {
+      const next = mode === "reroll"
+        ? rerollItinerary({
+            activities: acts,
+            days,
+            ratings,
+            mustDos,
+            members,
+            seed: shuffleSeed.current++,
+            avoidSignatures: proposal ? [proposal.signature] : []
+          })
+        : optimizeItinerary({ activities: acts, days });
+      setProposal({
+        ...next,
+        mode
+      });
+    } finally {
+      setShuffleBusy("");
+    }
+  };
+  const dismissProposal = () => { setProposal(null); };
+  const applyProposal = async () => {
+    if (!proposal || !canBuildItinerary) return;
+    if (!isArbiter) {
+      alert("Only Dad can apply a proposed arrangement.");
+      return;
+    }
+    setApplyingProposal(true);
+    setBuildMsg(null);
+    try {
+      const moved = proposal.assignments.filter((assignment) => !assignment.locked).length;
+      await commitArrangement({
+        assignments: proposal.assignments,
+        didNotFit: proposal.didNotFit,
+        message: proposal.mode === "optimize"
+          ? "Applied the optimized day order."
+          : `Applied the re-roll proposal. ${moved} ${moved === 1 ? "activity" : "activities"} were placed into days and ${proposal.didNotFit.length} moved to Maybe later.`
+      });
+      setProposal(null);
+    } finally {
+      setApplyingProposal(false);
     }
   };
   const moveToDay = async (a, dayId) => {
@@ -307,7 +373,21 @@ export default function App() {
       reorder: reorderInDay
     }
   };
-  const dayItems = (dayId) => acts.filter((a) => a.day_id === dayId && a.status === "scheduled").sort((x, y) => (x.done - y.done) || ((x.start_time || "99") < (y.start_time || "99") ? -1 : x.sort - y.sort));
+  const sortDayItems = (items) => items.slice().sort((x, y) => (x.done - y.done) || String(x.start_time || "99").localeCompare(String(y.start_time || "99")) || ((x.sort || 0) - (y.sort || 0)));
+  const showingProposal = Boolean(proposal);
+  const proposalById = new Map((proposal?.assignments || []).map((assignment) => [assignment.id, assignment]));
+  const dayItems = (dayId) => sortDayItems(acts.filter((a) => a.day_id === dayId && a.status === "scheduled"));
+  const proposalDayItems = (dayId) => sortDayItems(
+    acts
+      .filter((a) => proposalById.get(a.id)?.day_id === dayId)
+      .map((a) => ({ ...a, ...proposalById.get(a.id), status: "scheduled" }))
+  );
+  const proposalModeLabel = proposal?.mode === "optimize" ? "Optimized preview" : "Re-roll preview";
+  const proposalSummary = proposal
+    ? proposal.didNotFit.length
+      ? `${proposal.didNotFit.length} ${proposal.didNotFit.length === 1 ? "activity would move" : "activities would move"} to Maybe later if Dad applies this.`
+      : "Everything still fits into the week in this preview."
+    : "";
   const rankScore = (a) => (groupAvg(a, ratings) || 0) + mustWeight(a, mustDos, members);
 
   const tStr = todayStr();
@@ -381,11 +461,36 @@ export default function App() {
 
         {todayIdx >= 0 && <EnergyPulseCard pulses={pulses} dayKey={tStr} onSubmit={submitPulse} />}
         <button className="suggestbtn" onClick={() => setSheet({ mode: "suggest" })}>＋ Suggest something now</button>
-        <button className="buildbtn" onClick={runBuildItinerary} disabled={building || !canBuildItinerary}>
+        <button className="buildbtn" onClick={runBuildItinerary} disabled={building || applyingProposal || !canBuildItinerary}>
           {building ? "Building..." : "Build itinerary from rated activities"}
         </button>
+        <div className="shufflebar">
+          <button className="shufflebtn" onClick={() => proposeArrangement("reroll")} disabled={!canBuildItinerary || building || applyingProposal || shuffleBusy === "optimize"}>
+            {shuffleBusy === "reroll" ? "Re-rolling..." : "Re-roll"}
+          </button>
+          <button className="shufflebtn" onClick={() => proposeArrangement("optimize")} disabled={!canBuildItinerary || building || applyingProposal || shuffleBusy === "reroll"}>
+            {shuffleBusy === "optimize" ? "Optimizing..." : "Optimize"}
+          </button>
+        </div>
         {buildGateStatus && <div className="buildnote">{buildGateStatus}</div>}
         <div className="buildnote">Unlocked activities can move when you rebuild. Lock pinned items first.</div>
+        {proposal && <div className="proposalpanel">
+          <div className="proposaleyebrow">Preview only</div>
+          <div className="proposalhead">
+            <div>
+              <div className="proposaltitle">{proposalModeLabel}</div>
+              <div className="proposaltext">{isArbiter ? "Review it here, then apply it if you want the live itinerary updated." : "Proposed - needs Dad to apply before the live itinerary changes."}</div>
+            </div>
+            <span className="proposalpill">{proposal.mode === "optimize" ? "same days, tighter order" : "fresh arrangement"}</span>
+          </div>
+          <div className="proposaltext">{proposalSummary}</div>
+          <div className="proposalactions">
+            {isArbiter && <button className="proposalapply" onClick={applyProposal} disabled={applyingProposal || !canBuildItinerary}>
+              {applyingProposal ? "Applying..." : "Apply this arrangement"}
+            </button>}
+            <button className="proposaldismiss" onClick={dismissProposal} disabled={applyingProposal}>Dismiss</button>
+          </div>
+        </div>}
         {buildMsg && <div className="buildmsg">{buildMsg}</div>}
 
         {proposed.length > 0 && <>
@@ -393,14 +498,14 @@ export default function App() {
           {proposed.map((a) => <ActivityCard key={a.id} a={a} context="suggest" accent={REGION["Island-wide"]} {...cardProps} />)}
         </>}
 
-        <div className="section-label">The week · tap ✨ to build a day from rated activities</div>
+        <div className="section-label">{showingProposal ? "Proposed week · preview only until Dad applies it" : "The week · tap ✨ to build a day from rated activities"}</div>
         {days.map((day) => {
-          const items = dayItems(day.id); const A = ac(day.region); const open = plannerDay === day.id;
+          const items = showingProposal ? proposalDayItems(day.id) : dayItems(day.id); const A = ac(day.region); const open = plannerDay === day.id;
           const ph = dayPhase(day.sort);
           const isToday = day.date === tStr;
           const isTomorrow = todayIdx >= 0 && day.sort === days[todayIdx].sort + 1;
           return (
-            <div className={"day" + (isToday ? " today" : "")} key={day.id}>
+            <div className={"day" + (isToday ? " today" : "") + (showingProposal ? " proposalday" : "")} key={day.id}>
               <div className="dayhead">
                 <span className="daynum" style={{ "--ac": A }}>{day.date.slice(8)}</span>
                 <span>
@@ -409,13 +514,17 @@ export default function App() {
                 </span>
                 <span className="dayphase">{cap(ph)}</span>
               </div>
-              {items.map((a) => <ActivityCard key={a.id} a={a} context="day" accent={A} {...cardProps} />)}
-              {items.length === 0 && <div className="emptyhint" style={{ margin: "2px 0 6px" }}>Empty — tap ✨ to pull in rated activities, or + Add.</div>}
-              <div className="dayactions">
+              {items.map((a) => showingProposal
+                ? <ProposalActivityCard key={a.id} a={a} accent={A} mustDos={mustDos} />
+                : <ActivityCard key={a.id} a={a} context="day" accent={A} {...cardProps} />)}
+              {items.length === 0 && <div className={"emptyhint" + (showingProposal ? " proposalempty" : "")} style={{ margin: "2px 0 6px" }}>
+                {showingProposal ? "Nothing would land on this day in the preview." : "Empty — tap ✨ to pull in rated activities, or + Add."}
+              </div>}
+              {!showingProposal && <div className="dayactions">
                 <button className="addbtn slim" onClick={() => setSheet({ mode: "day", dayId: day.id, dayLabel: `${dow(day.date)} ${day.date.slice(8)}` })}>+ Add</button>
                 <button className={"planbtn" + (open ? " on" : "")} onClick={() => setPlannerDay(open ? null : day.id)}>✨ Suggest for this day</button>
-              </div>
-              {open && <PlannerPanel day={day} dPhase={ph} acts={acts} ratings={ratings} mustDos={mustDos} members={members} dad={dad} onSchedule={schedule} onDraft={draftDay} />}
+              </div>}
+              {!showingProposal && open && <PlannerPanel day={day} dPhase={ph} acts={acts} ratings={ratings} mustDos={mustDos} members={members} dad={dad} onSchedule={schedule} onDraft={draftDay} />}
             </div>
           );
         })}
@@ -586,6 +695,27 @@ function EnergyPulseCard({ pulses, dayKey, onSubmit }) {
       {note && <div className="pulsenote">{note}</div>}
       {error && <div className="pulseerror">{error}</div>}
     </section>
+  );
+}
+
+function ProposalActivityCard({ a, accent, mustDos }) {
+  const mustCount = mustDos.filter((x) => x.activity_id === a.id).length;
+
+  return (
+    <div className={"act proposalact" + (a.done ? " done" : "")} style={{ "--ac": accent }}>
+      <div className="acttop">
+        <div className="acttitle">
+          <div className="aname">{a.start_time && <span className="atime">{fmtTime(a.start_time)}</span>}{a.title}</div>
+          {a.notes && <div className="anote">{a.notes}</div>}
+          {(a.phase || mustCount > 0 || a.locked) && <div className="flags">
+            {a.phase && <span className="phasechip">{PHASE[a.phase] || a.phase}</span>}
+            {a.locked && <span className="lockchip">locked</span>}
+            {mustCount > 0 && <span className="mustbadge">★ {mustCount}</span>}
+          </div>}
+        </div>
+        <span className="proposaltag">preview</span>
+      </div>
+    </div>
   );
 }
 
