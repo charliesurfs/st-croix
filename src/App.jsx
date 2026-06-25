@@ -70,8 +70,13 @@ export default function App() {
   const [proposal, setProposal] = useState(null);
   const [shuffleBusy, setShuffleBusy] = useState("");
   const [applyingProposal, setApplyingProposal] = useState(false);
+  const [myNote, setMyNote] = useState("");
+  const [myNoteLoaded, setMyNoteLoaded] = useState(false);
+  const [myNoteStatus, setMyNoteStatus] = useState("idle");
   const reloadTimer = useRef(null);
   const wantTimers = useRef({});
+  const noteSaveTimer = useRef(null);
+  const savedNoteRef = useRef("");
   const shuffleSeed = useRef(Math.floor(Date.now() % 1000000) || 1);
   const proposalRef = useRef(null);
 
@@ -130,6 +135,57 @@ export default function App() {
     return () => { supabase.removeChannel(ch); };
   }, [loadAll]);
   useEffect(() => { getWeather().then(setWeather).catch(() => setWeather("err")); }, []);
+  useEffect(() => {
+    clearTimeout(noteSaveTimer.current);
+    savedNoteRef.current = "";
+    setMyNote("");
+    setMyNoteLoaded(false);
+    setMyNoteStatus("idle");
+    if (status !== "ready" || !meId || !trip?.id) return;
+    let cancelled = false;
+    const loadMyNote = async () => {
+      // App-enforced privacy: only ever request the logged-in member's own note.
+      const { data, error } = await supabase
+        .from("member_notes")
+        .select("note, updated_at")
+        .eq("member_id", meId)
+        .maybeSingle();
+      if (cancelled) return;
+      const nextNote = data?.note || "";
+      savedNoteRef.current = nextNote;
+      setMyNote(nextNote);
+      setMyNoteLoaded(true);
+      setMyNoteStatus(error ? "error" : "idle");
+    };
+    loadMyNote();
+    return () => {
+      cancelled = true;
+      clearTimeout(noteSaveTimer.current);
+    };
+  }, [meId, status, trip?.id]);
+  useEffect(() => {
+    if (status !== "ready" || !meId || !trip?.id || !myNoteLoaded) return;
+    if (myNote === savedNoteRef.current) return;
+    clearTimeout(noteSaveTimer.current);
+    noteSaveTimer.current = setTimeout(async () => {
+      setMyNoteStatus("saving");
+      const { error } = await supabase
+        .from("member_notes")
+        .upsert({
+          member_id: meId,
+          trip_id: trip.id,
+          note: myNote,
+          updated_at: new Date().toISOString()
+        }, { onConflict: "member_id" });
+      if (error) {
+        setMyNoteStatus("error");
+        return;
+      }
+      savedNoteRef.current = myNote;
+      setMyNoteStatus("saved");
+    }, 800);
+    return () => { clearTimeout(noteSaveTimer.current); };
+  }, [meId, myNote, myNoteLoaded, status, trip?.id]);
   useEffect(() => { proposalRef.current = proposal; }, [proposal]);
   useEffect(() => {
     if (!proposalRef.current) return;
@@ -388,6 +444,13 @@ export default function App() {
       ? `${proposal.didNotFit.length} ${proposal.didNotFit.length === 1 ? "activity would move" : "activities would move"} to Maybe later if Dad applies this.`
       : "Everything still fits into the week in this preview."
     : "";
+  const noteStatusLabel = myNoteStatus === "saving"
+    ? "Saving..."
+    : myNoteStatus === "saved"
+      ? "Saved"
+      : myNoteStatus === "error"
+        ? "Couldn't save right now."
+        : "";
   const rankScore = (a) => (groupAvg(a, ratings) || 0) + mustWeight(a, mustDos, members);
 
   const tStr = todayStr();
@@ -425,6 +488,16 @@ export default function App() {
         </div>
 
         <p className="introline">Step 1 — add everything you'd want to do, rate it 1–5, and tag roughly when it fits. We'll build the daily schedule next.</p>
+        <PrivateNotesCard
+          note={myNote}
+          loaded={myNoteLoaded}
+          statusLabel={noteStatusLabel}
+          statusTone={myNoteStatus === "error" ? "error" : myNoteStatus === "saved" ? "saved" : ""}
+          onChange={(value) => {
+            setMyNote(value);
+            if (myNoteStatus !== "saving") setMyNoteStatus("typing");
+          }}
+        />
 
         <div className="sortrow">
           <button className={sortMode === "wanted" ? "on" : ""} onClick={() => setSortMode("wanted")}>Most wanted</button>
@@ -716,6 +789,27 @@ function ProposalActivityCard({ a, accent, mustDos }) {
         <span className="proposaltag">preview</span>
       </div>
     </div>
+  );
+}
+
+function PrivateNotesCard({ note, loaded, statusLabel, statusTone, onChange }) {
+  return (
+    <section className="notescard">
+      <div className="noteshead">
+        <div>
+          <h2 className="display notestitle">My private notes</h2>
+          <p className="noteshelper">Only you see this. Dump your ideas, must-dos, and what you're hoping for on the trip.</p>
+        </div>
+        {statusLabel && <span className={"notestatus" + (statusTone ? ` ${statusTone}` : "")}>{statusLabel}</span>}
+      </div>
+      <textarea
+        className="notesbox"
+        value={note}
+        disabled={!loaded}
+        placeholder={loaded ? "Beach day thoughts, food priorities, backup plans, birthday ideas..." : "Loading your note..."}
+        onChange={(e) => onChange(e.target.value)}
+      />
+    </section>
   );
 }
 

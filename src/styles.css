@@ -210,6 +210,15 @@ main{ padding-bottom:calc(env(safe-area-inset-bottom) + 80px); }
 
 /* ---------- restructure: Activities (Stage 1) flat list ---------- */
 .introline{ font-size:13px; color:var(--ink); line-height:1.5; background:var(--glass); border:1px solid var(--line); border-radius:12px; padding:11px 13px; margin:8px 0 12px; }
+.notescard{ background:var(--card); border:1px solid var(--line); border-radius:14px; padding:13px; margin:0 0 12px; }
+.noteshead{ display:flex; align-items:flex-start; justify-content:space-between; gap:10px; margin-bottom:9px; }
+.notestitle{ font-size:18px; line-height:1.1; margin:0 0 4px; }
+.noteshelper{ font-size:12px; color:var(--muted); line-height:1.45; margin:0; }
+.notestatus{ flex-shrink:0; font-size:11px; color:var(--muted); background:var(--glass); border:1px solid var(--line); border-radius:999px; padding:4px 8px; }
+.notestatus.saved{ color:var(--green); border-color:#CFE4D6; background:#E8F4EC; }
+.notestatus.error{ color:#B23A28; border-color:#F3C5B8; background:#FBE7DF; }
+.notesbox{ width:100%; min-height:142px; resize:vertical; border-radius:12px; border:1.5px solid var(--line); background:#fff; color:var(--ink); padding:12px 13px; font-size:14px; line-height:1.5; }
+.notesbox:disabled{ background:#F8F2E5; color:var(--muted); }
 .sortrow{ display:flex; gap:7px; margin:0 0 12px; }
 .sortrow button{ flex:1; padding:9px; border-radius:10px; border:1.5px solid var(--line); background:#fff; color:var(--muted); font-weight:600; font-size:12.5px; }
 .sortrow button.on{ border-color:var(--teal2); background:var(--teal2); color:#fff; }
