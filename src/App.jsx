@@ -14,9 +14,21 @@ const RLABELS = ["Don't want", "Eh", "Maybe", "Want to", "Really want"];
 const PHASE = { early: "early trip", mid: "mid trip", late: "late trip" };
 const DAY_BUDGET = 540; // ~9 hrs of daytime activity
 const PIN_RE = /^\d{4,6}$/;
+const ENERGY_LEVELS = [
+  { value: 1, emoji: "😴", label: "Wiped" },
+  { value: 2, emoji: "🙂", label: "Low" },
+  { value: 3, emoji: "👌", label: "Steady" },
+  { value: 4, emoji: "⚡", label: "Up for more" },
+  { value: 5, emoji: "🔥", label: "High-energy" }
+];
 const fmtTime = (t) => { if (!t) return ""; const [h, m] = t.split(":").map(Number); return `${((h + 11) % 12) + 1}:${String(m).padStart(2, "0")} ${h < 12 ? "AM" : "PM"}`; };
 const dow = (d) => d ? ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"][new Date(d + "T12:00").getDay()] : "";
 const todayStr = () => { const t = new Date(); return `${t.getFullYear()}-${String(t.getMonth() + 1).padStart(2, "0")}-${String(t.getDate()).padStart(2, "0")}`; };
+const dateKey = (value) => {
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) return null;
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+};
 const dwellOf = (a) => a.dwell_min || 75;
 const cap = (s) => s ? s[0].toUpperCase() + s.slice(1) : s;
 // Derived day phase from its order in the trip: 0-2 early, 3-4 mid, 5-7 late.
@@ -45,6 +57,7 @@ export default function App() {
   const [acts, setActs] = useState([]);
   const [ratings, setRatings] = useState([]);
   const [mustDos, setMustDos] = useState([]);
+  const [pulses, setPulses] = useState([]);
   const [meId, setMeId] = useState(() => localStorage.getItem(ME_KEY) || null);
   const [status, setStatus] = useState("loading");
   const [gate, setGate] = useState({ mode: "grid", memberId: null });
@@ -63,16 +76,17 @@ export default function App() {
     if (error) { setStatus("error"); return; }
     const t = trips && trips[0];
     if (!t) { setStatus("error"); return; }
-    const [m, d, a, r, md] = await Promise.all([
+    const [m, d, a, r, md, p] = await Promise.all([
       supabase.from("members").select("*").eq("trip_id", t.id),
       supabase.from("days").select("*").eq("trip_id", t.id).order("sort"),
       supabase.from("activities").select("*").eq("trip_id", t.id).order("sort"),
       supabase.from("ratings").select("*"),
-      supabase.from("must_dos").select("*")
+      supabase.from("must_dos").select("*"),
+      supabase.from("pulses").select("*").eq("trip_id", t.id).order("created_at", { ascending: false })
     ]);
     const nextMembers = m.data || [];
     setTrip(t); setMembers(nextMembers); setDays(d.data || []);
-    setActs(a.data || []); setRatings(r.data || []); setMustDos(md.data || []);
+    setActs(a.data || []); setRatings(r.data || []); setMustDos(md.data || []); setPulses(p.data || []);
     const storedId = localStorage.getItem(ME_KEY);
     const storedMember = nextMembers.find((x) => x.id === storedId) || null;
     if (storedMember) {
@@ -107,6 +121,7 @@ export default function App() {
       .on("postgres_changes", { event: "*", schema: "public", table: "must_dos" }, reload)
       .on("postgres_changes", { event: "*", schema: "public", table: "days" }, reload)
       .on("postgres_changes", { event: "*", schema: "public", table: "members" }, reload)
+      .on("postgres_changes", { event: "*", schema: "public", table: "pulses" }, reload)
       .subscribe();
     return () => { supabase.removeChannel(ch); };
   }, [loadAll]);
@@ -178,6 +193,12 @@ export default function App() {
     await supabase.from("activities").insert(base); setSheet(null); loadAll();
   };
   const draftDay = async (day, list) => { for (const a of list) await supabase.from("activities").update({ status: "scheduled", day_id: day.id }).eq("id", a.id); loadAll(); };
+  const submitPulse = async (energy) => {
+    if (!trip) return;
+    const { error } = await supabase.from("pulses").insert({ trip_id: trip.id, day: todayStr(), energy });
+    if (error) throw error;
+    loadAll();
+  };
   const runBuildItinerary = async () => {
     const overrideNote = !everyoneFinished && isArbiter
       ? `\n\nNote: ${waitingCount} of ${totalMembers} members haven't finished rating yet. Build anyway?`
@@ -358,6 +379,7 @@ export default function App() {
           ? <p className="introline">Step 2 — once activities are rated, build each day here. Tap ✨ on a day to pull in the top-rated picks that fit.</p>
           : <div className="todaybanner mono">{banner}</div>}
 
+        {todayIdx >= 0 && <EnergyPulseCard pulses={pulses} dayKey={tStr} onSubmit={submitPulse} />}
         <button className="suggestbtn" onClick={() => setSheet({ mode: "suggest" })}>＋ Suggest something now</button>
         <button className="buildbtn" onClick={runBuildItinerary} disabled={building || !canBuildItinerary}>
           {building ? "Building..." : "Build itinerary from rated activities"}
@@ -497,6 +519,73 @@ function IdentityGate({ members, gate, onChooseMember, onClaimPin, onEnterPin, o
         </button>)}
       </div>
     </div></div>
+  );
+}
+
+function EnergyPulseCard({ pulses, dayKey, onSubmit }) {
+  const [busy, setBusy] = useState(false);
+  const [note, setNote] = useState("");
+  const [error, setError] = useState("");
+
+  const todaysPulses = pulses.filter((pulse) => {
+    const energy = Number(pulse.energy);
+    if (!Number.isInteger(energy) || energy < 1 || energy > 5) return false;
+    return (pulse.created_at && dateKey(pulse.created_at) === dayKey) || pulse.day === dayKey;
+  });
+  const counts = ENERGY_LEVELS.map((level) => todaysPulses.filter((pulse) => Number(pulse.energy) === level.value).length);
+  const total = todaysPulses.length;
+  const average = total ? todaysPulses.reduce((sum, pulse) => sum + Number(pulse.energy), 0) / total : null;
+
+  const send = async (value) => {
+    setBusy(true);
+    setError("");
+    setNote("");
+    try {
+      await onSubmit(value);
+      setNote("Added to today's anonymous pulse.");
+    } catch (err) {
+      setError(err.message || "Couldn't send your pulse right now.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <section className="pulsecard">
+      <div className="pulsehead">
+        <div>
+          <div className="pulseeyebrow">Anonymous energy pulse</div>
+          <div className="pulsetitle">How's everyone's energy?</div>
+        </div>
+        <div className="pulseavg">
+          <span className="pulseavgnum">{average ? average.toFixed(1) : "—"}</span>
+          <span className="pulseavgmax">/5</span>
+        </div>
+      </div>
+      <div className="pulsesub">Group-only, today-only vibe check. {total ? `${total} check-in${total === 1 ? "" : "s"} so far.` : "No check-ins yet today."}</div>
+
+      <div className="pulseactions">
+        {ENERGY_LEVELS.map((level) => (
+          <button key={level.value} className="pulsebtn" onClick={() => send(level.value)} disabled={busy} aria-label={`send energy ${level.value} of 5`}>
+            <span className="pulseemoji" aria-hidden="true">{level.emoji}</span>
+            <span className="pulsebtnlabel">{level.label}</span>
+          </button>
+        ))}
+      </div>
+
+      <div className="pulsedist">
+        {ENERGY_LEVELS.map((level, i) => (
+          <div className="pulserow" key={level.value}>
+            <div className="pulselevel"><span aria-hidden="true">{level.emoji}</span>{level.label}</div>
+            <div className="pulsebarwrap"><div className="pulsebar" style={{ width: `${total ? counts[i] / total * 100 : 0}%` }} /></div>
+            <div className="pulsecnt mono">{counts[i]}</div>
+          </div>
+        ))}
+      </div>
+
+      {note && <div className="pulsenote">{note}</div>}
+      {error && <div className="pulseerror">{error}</div>}
+    </section>
   );
 }
 
