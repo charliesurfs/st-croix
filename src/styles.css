@@ -219,6 +219,12 @@ main{ padding-bottom:calc(env(safe-area-inset-bottom) + 80px); }
 .notestatus.error{ color:#B23A28; border-color:#F3C5B8; background:#FBE7DF; }
 .notesbox{ width:100%; min-height:142px; resize:vertical; border-radius:12px; border:1.5px solid var(--line); background:#fff; color:var(--ink); padding:12px 13px; font-size:14px; line-height:1.5; }
 .notesbox:disabled{ background:#F8F2E5; color:var(--muted); }
+.notesfooter{ display:grid; gap:10px; margin-top:12px; }
+.notesactions{ display:flex; }
+.notesactionbtn{ width:100%; padding:11px 12px; border-radius:12px; border:1.5px solid var(--teal2); background:#fff; color:var(--teal); font-weight:700; font-size:12.5px; }
+.notesactionbtn:disabled{ opacity:.65; cursor:wait; }
+.notesnotice{ font-size:11.5px; border-radius:11px; padding:9px 11px; color:var(--green); background:#E8F4EC; border:1px solid #CFE4D6; }
+.notesnotice.error{ color:#B23A28; background:#FBE7DF; border-color:#F3C5B8; }
 .sortrow{ display:flex; gap:7px; margin:0 0 12px; }
 .sortrow button{ flex:1; padding:9px; border-radius:10px; border:1.5px solid var(--line); background:#fff; color:var(--muted); font-weight:600; font-size:12.5px; }
 .sortrow button.on{ border-color:var(--teal2); background:var(--teal2); color:#fff; }
@@ -258,6 +264,12 @@ main{ padding-bottom:calc(env(safe-area-inset-bottom) + 80px); }
 .proposalapply{ flex:1; border:none; background:var(--teal); color:#fff; }
 .proposaldismiss{ border:1.5px solid #E9D7A8; background:transparent; color:#9A6A12; }
 .proposalapply:disabled,.proposaldismiss:disabled{ opacity:.65; cursor:wait; }
+.aiplansection{ font-size:11px; font-weight:700; letter-spacing:.06em; text-transform:uppercase; color:#9A6A12; margin:14px 0 8px; }
+.aiplanstack{ display:grid; gap:8px; }
+.aiplanitem,.aiplanflag{ background:rgba(255,255,255,.7); border:1px solid #E9D7A8; border-radius:12px; padding:10px 11px; }
+.aiplanitemhead,.aiplanflaghead{ display:flex; align-items:flex-start; justify-content:space-between; gap:10px; }
+.aiplanitemhead strong,.aiplanflaghead strong{ font-size:13px; line-height:1.35; color:var(--ink); }
+.aiplanempty{ font-size:12px; color:var(--muted); line-height:1.45; background:rgba(255,255,255,.7); border:1px dashed #E9D7A8; border-radius:12px; padding:11px; }
 .proposalday{ background:#FFF9EE; border:1px dashed #E9D7A8; border-radius:14px; padding:4px 10px 6px; }
 .proposalempty{ background:#FBF1DC; border:1px dashed #E9D7A8; }
 .proposalact{ background:#FFFCF5; border-style:dashed; }
