@@ -62,7 +62,7 @@ export default function App() {
   const [gate, setGate] = useState({ mode: "grid", memberId: null });
   const [weather, setWeather] = useState(null);
   const [view, setView] = useState("activities");   // 'activities' (Stage 1) | 'itinerary' (Stage 2 + live)
-  const [sortMode, setSortMode] = useState("wanted"); // 'wanted' | 'when'
+  const [activityView, setActivityView] = useState("rate"); // 'rate' | 'wanted' | 'when'
   const [sheet, setSheet] = useState(null);
   const [plannerDay, setPlannerDay] = useState(null);
   const [building, setBuilding] = useState(false);
@@ -84,6 +84,7 @@ export default function App() {
   const savedNoteRef = useRef("");
   const shuffleSeed = useRef(Math.floor(Date.now() % 1000000) || 1);
   const proposalRef = useRef(null);
+  const [rateOrderIds, setRateOrderIds] = useState([]);
 
   const loadAll = useCallback(async () => {
     const { data: trips, error } = await supabase.from("trips").select("*").limit(1);
@@ -206,6 +207,17 @@ export default function App() {
     setAiPlanMsg("");
     setAiPlanError("");
   }, [members, meId]);
+  useEffect(() => {
+    const unscheduledIds = acts.filter((activity) => !activity.day_id).map((activity) => activity.id);
+    setRateOrderIds((prev) => {
+      const activeIds = new Set(unscheduledIds);
+      const kept = prev.filter((id) => activeIds.has(id));
+      const seen = new Set(kept);
+      const additions = unscheduledIds.filter((id) => !seen.has(id));
+      if (kept.length === prev.length && additions.length === 0) return prev;
+      return [...kept, ...additions];
+    });
+  }, [acts]);
 
   const me = members.find((x) => x.id === meId) || null;
   const enterAppAs = (id) => {
@@ -567,26 +579,71 @@ export default function App() {
 
   // ---------- ACTIVITIES (Stage 1) - flat rated list ----------
   function renderActivities() {
-    const candidates = acts.filter((a) => !a.day_id && (a.status === "idea" || a.status === "proposed"));
-    const maybe = acts.filter((a) => !a.day_id && a.status === "maybe_later");
+    const phaseGroups = [["early", "Early trip"], ["mid", "Mid trip"], ["late", "Late trip"], [null, "Whenever"]];
+    const unscheduled = acts.filter((activity) => !activity.day_id);
+    const unscheduledById = new Map(unscheduled.map((activity) => [activity.id, activity]));
+    const stableBase = rateOrderIds
+      .map((id) => unscheduledById.get(id))
+      .filter(Boolean);
+    const seenIds = new Set(stableBase.map((activity) => activity.id));
+    const stableActivities = [
+      ...stableBase,
+      ...unscheduled.filter((activity) => !seenIds.has(activity.id))
+    ];
+    const stableIndex = new Map(stableActivities.map((activity, index) => [activity.id, index]));
+    const candidates = stableActivities.filter((activity) => activity.status === "idea" || activity.status === "proposed");
+    const parked = stableActivities.filter((activity) => activity.status === "maybe_later");
+    const phaseRank = (activity) => ({ early: 0, mid: 1, late: 2 }[activity.phase] ?? 3);
+    const sortByRank = (left, right) =>
+      (rankScore(right) - rankScore(left))
+      || ((stableIndex.get(left.id) ?? 0) - (stableIndex.get(right.id) ?? 0));
+    const sortByPhaseThenRank = (left, right) =>
+      (phaseRank(left) - phaseRank(right))
+      || sortByRank(left, right);
+    const readOnly = activityView !== "rate";
+    const renderCards = (items, options = {}) => items.map((activity) => (
+      <ActivityCard
+        key={activity.id}
+        a={activity}
+        context="flat"
+        accent={ac(activity.region)}
+        readOnly={options.readOnly ?? readOnly}
+        allowMaybeAction={options.allowMaybeAction}
+        allowScheduleAction={options.allowScheduleAction}
+        {...cardProps}
+      />
+    ));
 
     let body;
-    if (sortMode === "wanted") {
-      const sorted = [...candidates].sort((x, y) => rankScore(y) - rankScore(x));
-      body = sorted.map((a) => <ActivityCard key={a.id} a={a} context="flat" accent={ac(a.region)} {...cardProps} />);
+    if (activityView === "rate") {
+      body = renderCards(candidates);
+    } else if (activityView === "wanted") {
+      body = renderCards([...candidates].sort(sortByRank), { readOnly: true });
     } else {
-      const groups = [["early", "Early trip"], ["mid", "Mid trip"], ["late", "Late trip"], [null, "Whenever"]];
-      body = groups.map(([ph, label]) => {
-        const items = candidates.filter((a) => (a.phase || null) === ph).sort((x, y) => rankScore(y) - rankScore(x));
+      body = phaseGroups.map(([phase, label]) => {
+        const items = candidates
+          .filter((activity) => (activity.phase || null) === phase)
+          .sort(sortByRank);
         if (!items.length) return null;
         return (
           <React.Fragment key={label}>
             <div className="section-label">{label}</div>
-            {items.map((a) => <ActivityCard key={a.id} a={a} context="flat" accent={ac(a.region)} {...cardProps} />)}
+            {renderCards(items, { readOnly: true })}
           </React.Fragment>
         );
       });
     }
+
+    const parkedItems = activityView === "rate"
+      ? parked
+      : activityView === "wanted"
+        ? [...parked].sort(sortByRank)
+        : [...parked].sort(sortByPhaseThenRank);
+    const viewNote = activityView === "rate"
+      ? "Rate view stays stable while you tap. Ratings, must-dos, and phase tags update the card but never reshuffle the list."
+      : activityView === "wanted"
+        ? "Read-only view - ranked by group interest plus must-do weight."
+        : "Read-only view - grouped by early, mid, late, then untagged activities.";
 
     return (
       <main className="wrap">
@@ -596,6 +653,12 @@ export default function App() {
         </div>
 
         <p className="introline">Step 1 — add everything you'd want to do, rate it 1–5, and tag roughly when it fits. We'll build the daily schedule next.</p>
+        <div className="sortrow">
+          <button className={activityView === "rate" ? "on" : ""} onClick={() => setActivityView("rate")}>Rate</button>
+          <button className={activityView === "wanted" ? "on" : ""} onClick={() => setActivityView("wanted")}>Most wanted</button>
+          <button className={activityView === "when" ? "on" : ""} onClick={() => setActivityView("when")}>By when</button>
+        </div>
+        <div className="viewnote">{viewNote}</div>
         <PrivateNotesCard
           note={myNote}
           loaded={myNoteLoaded}
@@ -626,19 +689,19 @@ export default function App() {
           onDismiss={dismissAiPlan}
         />}
 
-        <div className="sortrow">
-          <button className={sortMode === "wanted" ? "on" : ""} onClick={() => setSortMode("wanted")}>Most wanted</button>
-          <button className={sortMode === "when" ? "on" : ""} onClick={() => setSortMode("when")}>By when</button>
-        </div>
 
-        {candidates.length === 0 && <div className="emptyhint">Nothing here yet. Tap “+ Add activity” to start the list — everyone rates it, then you build the days over in Itinerary.</div>}
+        {candidates.length === 0 && parked.length === 0 && <div className="emptyhint">{activityView === "rate" ? "Nothing here yet. Tap + Add activity to start the list, then rate and tag without the cards jumping around." : "Nothing here yet. Switch to Rate to add activities, then come back here to browse the sorted views."}</div>}
         {body}
 
-        <button className="addbtn" onClick={() => setSheet({ mode: "wishlist" })}>+ Add activity</button>
+        {activityView === "rate" && <button className="addbtn" onClick={() => setSheet({ mode: "wishlist" })}>+ Add activity</button>}
 
-        {maybe.length > 0 && <>
+        {parked.length > 0 && <>
           <div className="section-label">Maybe later · parked</div>
-          {maybe.map((a) => <ActivityCard key={a.id} a={a} context="maybe" accent={ac(a.region)} {...cardProps} />)}
+          {renderCards(parkedItems, {
+            readOnly,
+            allowMaybeAction: false,
+            allowScheduleAction: false
+          })}
         </>}
       </main>
     );
@@ -1045,7 +1108,7 @@ function PlannerPanel({ day, dPhase, acts, ratings, mustDos, members, dad, onSch
   );
 }
 
-function ActivityCard({ a, context, accent, me, members, ratings, mustDos, myMustCount, limit, days, on }) {
+function ActivityCard({ a, context, accent, me, members, ratings, mustDos, myMustCount, limit, days, on, readOnly = false, allowMaybeAction = true, allowScheduleAction = true }) {
   const myR = ratings.find((r) => r.activity_id === a.id && r.member_id === me.id);
   const myWant = myR ? myR.want : 0;
   const all = ratings.filter((r) => r.activity_id === a.id);
@@ -1053,18 +1116,22 @@ function ActivityCard({ a, context, accent, me, members, ratings, mustDos, myMus
   const mustCount = mustDos.filter((x) => x.activity_id === a.id).length;          // anonymous count only
   const mine = mustDos.some((x) => x.activity_id === a.id && x.member_id === me.id); // my own flag (allowed)
   const atCap = limit != null && myMustCount >= limit && !mine;
-  const editPhase = context !== "day";
-  const showRate = context !== "maybe", showMust = context !== "maybe", showSchedule = context !== "day", showMaybe = context !== "maybe";
+  const showPhaseEditor = !readOnly && context !== "day";
+  const showRate = context !== "maybe";
+  const showMust = !readOnly && context !== "maybe";
+  const showSchedule = !readOnly && allowScheduleAction && context !== "day";
+  const showMaybe = !readOnly && allowMaybeAction && context !== "maybe";
+  const showDelete = !readOnly;
 
   return (
-    <div className={"act" + (a.done ? " done" : "")} style={{ "--ac": accent }}>
+    <div className={"act" + (a.done ? " done" : "") + (readOnly ? " readonly" : "")} style={{ "--ac": accent }}>
       <div className="acttop">
         {context === "day" && <button className={"donebox" + (a.done ? " on" : "")} onClick={() => on.done(a)} aria-label="mark done">{a.done ? "✓" : ""}</button>}
         <div className="acttitle">
           <div className="aname">{a.start_time && <span className="atime">{fmtTime(a.start_time)}</span>}{a.title}</div>
           {a.notes && <div className="anote">{a.notes}</div>}
-          {((!editPhase && a.phase) || mustCount > 0 || (context === "day" && a.locked)) && <div className="flags">
-            {!editPhase && a.phase && <span className="phasechip">{PHASE[a.phase] || a.phase}</span>}
+          {((!showPhaseEditor && a.phase) || mustCount > 0 || (context === "day" && a.locked)) && <div className="flags">
+            {!showPhaseEditor && a.phase && <span className="phasechip">{PHASE[a.phase] || a.phase}</span>}
             {context === "day" && a.locked && <span className="lockchip">locked</span>}
             {mustCount > 0 && <span className="mustbadge">★ {mustCount}</span>}
           </div>}
@@ -1072,7 +1139,7 @@ function ActivityCard({ a, context, accent, me, members, ratings, mustDos, myMus
         <button className="amenu" onClick={() => on.rename(a)} title="Rename">⋯</button>
       </div>
 
-      {editPhase && <div className="phaseedit">
+      {showPhaseEditor && <div className="phaseedit">
         <span className="phaselbl2">when</span>
         {[["early", "Early"], ["mid", "Mid"], ["late", "Late"]].map(([v, l]) =>
           <button key={v} className={"pchip" + (a.phase === v ? " on" : "")} onClick={() => on.setPhase(a, v)}>{l}</button>)}
@@ -1083,7 +1150,7 @@ function ActivityCard({ a, context, accent, me, members, ratings, mustDos, myMus
         <div className="raterow">
           <span className="ratemini">you</span>
           <div className="dots">{[1, 2, 3, 4, 5].map((n) => <button key={n} className={"rdot" + (myWant === n ? " on" : "")} onClick={() => on.want(a, n)} aria-label={`rate ${n} of 5`}>{n}</button>)}</div>
-          <span className="ratesel">{myWant ? RLABELS[myWant - 1] : "rate it"}</span>
+          <span className={"ratesel" + (readOnly ? " readonly" : "")}>{myWant ? RLABELS[myWant - 1] : readOnly ? "Not rated yet" : "rate it"}</span>
         </div>
         <div className="grouprow">
           <span className="ratemini">group</span>
@@ -1104,12 +1171,12 @@ function ActivityCard({ a, context, accent, me, members, ratings, mustDos, myMus
         </select>
       </div>}
 
-      <div className="actbtns">
+      {(showMust || showSchedule || showMaybe || showDelete) && <div className="actbtns">
         {showMust && <button className={"abtn" + (mine ? " on" : "")} disabled={atCap} onClick={() => on.must(a, mine)} title={atCap ? `All ${limit} must-dos used` : ""}>{mine ? "★ Must-do (mine)" : atCap ? "★ limit reached" : "☆ Must-do"}</button>}
         {showSchedule && <select className="schedsel" value="" onChange={(e) => on.schedule(a, e.target.value)}><option value="" disabled>＋ Into a day…</option>{days.map((d) => <option key={d.id} value={d.id}>{dow(d.date)} {d.date.slice(8)}{d.label ? ` — ${d.label.slice(0, 22)}` : ""}</option>)}</select>}
         {showMaybe && <button className="abtn" onClick={() => on.maybe(a)}>→ Maybe later</button>}
-        <button className="abtn danger" onClick={() => on.del(a)}>Delete</button>
-      </div>
+        {showDelete && <button className="abtn danger" onClick={() => on.del(a)}>Delete</button>}
+      </div>}
     </div>
   );
 }
