@@ -73,6 +73,11 @@ export default function App() {
   const [myNote, setMyNote] = useState("");
   const [myNoteLoaded, setMyNoteLoaded] = useState(false);
   const [myNoteStatus, setMyNoteStatus] = useState("idle");
+  const [aiPlanProposal, setAiPlanProposal] = useState(null);
+  const [aiPlanBusy, setAiPlanBusy] = useState(false);
+  const [applyingAiPlan, setApplyingAiPlan] = useState(false);
+  const [aiPlanMsg, setAiPlanMsg] = useState("");
+  const [aiPlanError, setAiPlanError] = useState("");
   const reloadTimer = useRef(null);
   const wantTimers = useRef({});
   const noteSaveTimer = useRef(null);
@@ -192,6 +197,15 @@ export default function App() {
     setProposal(null);
     setPlannerDay(null);
   }, [acts, days, ratings, mustDos]);
+  useEffect(() => {
+    const currentMe = members.find((x) => x.id === meId) || null;
+    const currentDad = members.find((member) => member.role === "arbiter");
+    const currentIsArbiter = currentMe && currentDad ? currentMe.id === currentDad.id : currentMe?.role === "arbiter";
+    if (currentIsArbiter) return;
+    setAiPlanProposal(null);
+    setAiPlanMsg("");
+    setAiPlanError("");
+  }, [members, meId]);
 
   const me = members.find((x) => x.id === meId) || null;
   const enterAppAs = (id) => {
@@ -353,6 +367,100 @@ export default function App() {
       setApplyingProposal(false);
     }
   };
+  const proposeAiPlan = async () => {
+    if (!isArbiter || aiPlanBusy || applyingAiPlan) return;
+    const dadNote = myNote.trim();
+    if (!dadNote) {
+      setAiPlanError("Write a few notes first, then ask for a proposed plan.");
+      setAiPlanMsg("");
+      return;
+    }
+    setAiPlanBusy(true);
+    setAiPlanError("");
+    setAiPlanMsg("");
+    setAiPlanProposal(null);
+    try {
+      const response = await fetch("/api/propose-plan", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          dadNote,
+          days: days.map(({ date, label }) => ({ date, label })),
+          activities: acts
+            .filter((activity) => activity.status !== "dropped")
+            .map((activity) => ({
+              title: activity.title,
+              region: activity.region,
+              groupAvg: groupAvg(activity, ratings)
+            }))
+        })
+      });
+      let payload = null;
+      try {
+        payload = await response.json();
+      } catch {
+        payload = null;
+      }
+      if (!response.ok || !payload) throw new Error("proposal_failed");
+      const nextProposal = {
+        summary: typeof payload.summary === "string" ? payload.summary.trim() : "",
+        spine: Array.isArray(payload.spine)
+          ? payload.spine
+              .filter((item) => item && typeof item.date === "string" && typeof item.theme === "string")
+              .map((item) => ({
+                date: item.date,
+                theme: item.theme.trim(),
+                rationale: typeof item.rationale === "string" ? item.rationale.trim() : ""
+              }))
+          : [],
+        flags: Array.isArray(payload.flags)
+          ? payload.flags
+              .filter((item) => item && typeof item.activity === "string")
+              .map((item) => ({
+                activity: item.activity.trim(),
+                groupAvg: typeof item.groupAvg === "number" ? item.groupAvg : null,
+                note: typeof item.note === "string" ? item.note.trim() : ""
+              }))
+          : []
+      };
+      if (!nextProposal.summary || nextProposal.spine.length === 0) throw new Error("proposal_failed");
+      setAiPlanProposal(nextProposal);
+    } catch {
+      setAiPlanProposal(null);
+      setAiPlanError("The AI couldn't generate a plan right now, try again.");
+    } finally {
+      setAiPlanBusy(false);
+    }
+  };
+  const dismissAiPlan = () => {
+    setAiPlanProposal(null);
+    setAiPlanError("");
+  };
+  const applyAiPlan = async () => {
+    if (!isArbiter) return;
+    if (!aiPlanProposal) return;
+    setApplyingAiPlan(true);
+    setAiPlanError("");
+    setAiPlanMsg("");
+    try {
+      let updated = 0;
+      for (const item of aiPlanProposal.spine) {
+        const day = days.find((entry) => entry.date === item.date);
+        if (!day) continue;
+        const { error } = await supabase.from("days").update({ label: item.theme }).eq("id", day.id);
+        if (error) throw error;
+        updated += 1;
+      }
+      if (!updated) throw new Error("no_matching_days");
+      setAiPlanProposal(null);
+      await loadAll();
+      setAiPlanMsg("Applied the proposed day themes.");
+    } catch {
+      setAiPlanError("Couldn't apply that plan right now.");
+    } finally {
+      setApplyingAiPlan(false);
+    }
+  };
   const moveToDay = async (a, dayId) => {
     if (!dayId || dayId === a.day_id) return;
     const target = acts.filter((x) => x.day_id === dayId && x.status === "scheduled");
@@ -493,11 +601,30 @@ export default function App() {
           loaded={myNoteLoaded}
           statusLabel={noteStatusLabel}
           statusTone={myNoteStatus === "error" ? "error" : myNoteStatus === "saved" ? "saved" : ""}
+          footer={isArbiter ? <>
+            <div className="notesactions">
+              <button
+                className="notesactionbtn"
+                onClick={proposeAiPlan}
+                disabled={!myNoteLoaded || aiPlanBusy || applyingAiPlan}
+              >
+                {aiPlanBusy ? "Thinking..." : "Propose a plan from my notes"}
+              </button>
+            </div>
+            {aiPlanMsg && <div className="notesnotice">{aiPlanMsg}</div>}
+            {aiPlanError && <div className="notesnotice error">{aiPlanError}</div>}
+          </> : null}
           onChange={(value) => {
             setMyNote(value);
             if (myNoteStatus !== "saving") setMyNoteStatus("typing");
           }}
         />
+        {isArbiter && aiPlanProposal && <AiPlanPreview
+          proposal={aiPlanProposal}
+          busy={applyingAiPlan}
+          onApply={applyAiPlan}
+          onDismiss={dismissAiPlan}
+        />}
 
         <div className="sortrow">
           <button className={sortMode === "wanted" ? "on" : ""} onClick={() => setSortMode("wanted")}>Most wanted</button>
@@ -792,7 +919,7 @@ function ProposalActivityCard({ a, accent, mustDos }) {
   );
 }
 
-function PrivateNotesCard({ note, loaded, statusLabel, statusTone, onChange }) {
+function PrivateNotesCard({ note, loaded, statusLabel, statusTone, onChange, footer }) {
   return (
     <section className="notescard">
       <div className="noteshead">
@@ -809,6 +936,58 @@ function PrivateNotesCard({ note, loaded, statusLabel, statusTone, onChange }) {
         placeholder={loaded ? "Beach day thoughts, food priorities, backup plans, birthday ideas..." : "Loading your note..."}
         onChange={(e) => onChange(e.target.value)}
       />
+      {footer && <div className="notesfooter">{footer}</div>}
+    </section>
+  );
+}
+
+function AiPlanPreview({ proposal, busy, onApply, onDismiss }) {
+  return (
+    <section className="proposalpanel">
+      <div className="proposaleyebrow">Preview only</div>
+      <div className="proposalhead">
+        <div>
+          <div className="proposaltitle">AI plan proposal</div>
+          <div className="proposaltext">Review the day themes here first. Applying this only updates the day labels, not the schedule itself.</div>
+        </div>
+        <span className="proposalpill">Dad's note to themes</span>
+      </div>
+      <div className="proposaltext">{proposal.summary}</div>
+
+      <div className="aiplansection">Heads-ups</div>
+      {proposal.flags.length > 0
+        ? <div className="aiplanstack">
+            {proposal.flags.map((flag, index) => (
+              <div className="aiplanflag" key={`${flag.activity}-${index}`}>
+                <div className="aiplanflaghead">
+                  <strong>{flag.activity}</strong>
+                  {typeof flag.groupAvg === "number" && <span className="proposalpill">group avg {flag.groupAvg.toFixed(1)}</span>}
+                </div>
+                {flag.note && <div className="proposaltext">{flag.note}</div>}
+              </div>
+            ))}
+          </div>
+        : <div className="aiplanempty">No low-interest tension flags jumped out in this pass.</div>}
+
+      <div className="aiplansection">Proposed trip spine</div>
+      <div className="aiplanstack">
+        {proposal.spine.map((item, index) => (
+          <div className="aiplanitem" key={`${item.date}-${index}`}>
+            <div className="aiplanitemhead">
+              <span className="mono">{dow(item.date)} {item.date}</span>
+              <strong>{item.theme}</strong>
+            </div>
+            {item.rationale && <div className="proposaltext">{item.rationale}</div>}
+          </div>
+        ))}
+      </div>
+
+      <div className="proposalactions">
+        <button className="proposalapply" onClick={onApply} disabled={busy}>
+          {busy ? "Applying..." : "Apply this plan"}
+        </button>
+        <button className="proposaldismiss" onClick={onDismiss} disabled={busy}>Dismiss</button>
+      </div>
     </section>
   );
 }
