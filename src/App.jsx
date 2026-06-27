@@ -79,7 +79,7 @@ export default function App() {
   const [aiPlanMsg, setAiPlanMsg] = useState("");
   const [aiPlanError, setAiPlanError] = useState("");
   const reloadTimer = useRef(null);
-  const wantTimers = useRef({});
+  const wantWrites = useRef({});
   const noteSaveTimer = useRef(null);
   const savedNoteRef = useRef("");
   const shuffleSeed = useRef(Math.floor(Date.now() % 1000000) || 1);
@@ -256,11 +256,44 @@ export default function App() {
     enterAppAs(member.id);
   };
 
+  const flushWant = useCallback(async (activityId, memberId) => {
+    const key = `${activityId}:${memberId}`;
+    const entry = wantWrites.current[key];
+    if (!entry || entry.inflight) return;
+
+    entry.inflight = true;
+    const desired = entry.value;
+    const { error } = await supabase
+      .from("ratings")
+      .upsert({ activity_id: activityId, member_id: memberId, want: desired }, { onConflict: "activity_id,member_id" });
+
+    const latest = wantWrites.current[key];
+    if (!latest) return;
+    latest.inflight = false;
+
+    if (latest.value !== desired) {
+      flushWant(activityId, memberId);
+      return;
+    }
+
+    delete wantWrites.current[key];
+    if (error) {
+      await loadAll();
+      alert("Couldn't save that vote right now.");
+    }
+  }, [loadAll]);
+
   // mutations
   const setWant = (a, val) => {
+    if (!meId) return;
     setRatings((prev) => [...prev.filter((r) => !(r.activity_id === a.id && r.member_id === meId)), { activity_id: a.id, member_id: meId, want: val }]);
-    clearTimeout(wantTimers.current[a.id]);
-    wantTimers.current[a.id] = setTimeout(() => supabase.from("ratings").upsert({ activity_id: a.id, member_id: meId, want: val }, { onConflict: "activity_id,member_id" }), 300);
+    const key = `${a.id}:${meId}`;
+    wantWrites.current[key] = {
+      ...(wantWrites.current[key] || {}),
+      value: val,
+      inflight: wantWrites.current[key]?.inflight || false
+    };
+    flushWant(a.id, meId);
   };
   const toggleMust = async (a, mine) => {
     if (mine) await supabase.from("must_dos").delete().match({ activity_id: a.id, member_id: meId });
