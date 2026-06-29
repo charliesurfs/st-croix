@@ -78,6 +78,7 @@ export default function App() {
   const [applyingAiPlan, setApplyingAiPlan] = useState(false);
   const [aiPlanMsg, setAiPlanMsg] = useState("");
   const [aiPlanError, setAiPlanError] = useState("");
+  const [rateJumpId, setRateJumpId] = useState("");
   const reloadTimer = useRef(null);
   const wantWrites = useRef({});
   const noteSaveTimer = useRef(null);
@@ -218,6 +219,20 @@ export default function App() {
       return [...kept, ...additions];
     });
   }, [acts]);
+  useEffect(() => {
+    if (activityView !== "rate" || !rateJumpId) return;
+    const jumpId = rateJumpId;
+    const frame = requestAnimationFrame(() => {
+      const card = document.querySelector(`[data-activity-id="${jumpId}"]`);
+      if (card) {
+        card.scrollIntoView({ behavior: "smooth", block: "center" });
+        const firstDot = card.querySelector(".rdot");
+        if (firstDot && typeof firstDot.focus === "function") firstDot.focus();
+      }
+      setRateJumpId("");
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [activityView, rateJumpId, acts]);
 
   const me = members.find((x) => x.id === meId) || null;
   const enterAppAs = (id) => {
@@ -605,6 +620,10 @@ export default function App() {
         ? "Couldn't save right now."
         : "";
   const rankScore = (a) => (groupAvg(a, ratings) || 0) + mustWeight(a, mustDos, members);
+  const jumpToRateView = (activityId) => {
+    setRateJumpId(activityId);
+    setActivityView("rate");
+  };
 
   const tStr = todayStr();
   const todayIdx = days.findIndex((d) => d.date === tStr);
@@ -643,6 +662,7 @@ export default function App() {
         readOnly={options.readOnly ?? readOnly}
         allowMaybeAction={options.allowMaybeAction}
         allowScheduleAction={options.allowScheduleAction}
+        onJumpToRate={jumpToRateView}
         {...cardProps}
       />
     ));
@@ -692,6 +712,13 @@ export default function App() {
           <button className={activityView === "when" ? "on" : ""} onClick={() => setActivityView("when")}>By when</button>
         </div>
         <div className="viewnote">{viewNote}</div>
+        {readOnly && <div className="readonlycallout">
+          <div>
+            <div className="readonlytitle">Browsing only</div>
+            <div className="readonlytext">These sorted views are display-only. Switch to Rate to change your vote, must-do, or timing.</div>
+          </div>
+          <button className="readonlycta" onClick={() => setActivityView("rate")}>Go to Rate</button>
+        </div>}
         <PrivateNotesCard
           note={myNote}
           loaded={myNoteLoaded}
@@ -1141,7 +1168,7 @@ function PlannerPanel({ day, dPhase, acts, ratings, mustDos, members, dad, onSch
   );
 }
 
-function ActivityCard({ a, context, accent, me, members, ratings, mustDos, myMustCount, limit, days, on, readOnly = false, allowMaybeAction = true, allowScheduleAction = true }) {
+function ActivityCard({ a, context, accent, me, members, ratings, mustDos, myMustCount, limit, days, on, readOnly = false, allowMaybeAction = true, allowScheduleAction = true, onJumpToRate }) {
   const myR = ratings.find((r) => r.activity_id === a.id && r.member_id === me.id);
   const myWant = myR ? myR.want : 0;
   const all = ratings.filter((r) => r.activity_id === a.id);
@@ -1155,9 +1182,10 @@ function ActivityCard({ a, context, accent, me, members, ratings, mustDos, myMus
   const showSchedule = !readOnly && allowScheduleAction && context !== "day";
   const showMaybe = !readOnly && allowMaybeAction && context !== "maybe";
   const showDelete = !readOnly;
+  const showRateJump = readOnly && context === "flat" && typeof onJumpToRate === "function";
 
   return (
-    <div className={"act" + (a.done ? " done" : "") + (readOnly ? " readonly" : "")} style={{ "--ac": accent }}>
+    <div className={"act" + (a.done ? " done" : "") + (readOnly ? " readonly" : "")} style={{ "--ac": accent }} data-activity-id={a.id}>
       <div className="acttop">
         {context === "day" && <button className={"donebox" + (a.done ? " on" : "")} onClick={() => on.done(a)} aria-label="mark done">{a.done ? "✓" : ""}</button>}
         <div className="acttitle">
@@ -1204,11 +1232,12 @@ function ActivityCard({ a, context, accent, me, members, ratings, mustDos, myMus
         </select>
       </div>}
 
-      {(showMust || showSchedule || showMaybe || showDelete) && <div className="actbtns">
+      {(showMust || showSchedule || showMaybe || showDelete || showRateJump) && <div className="actbtns">
         {showMust && <button className={"abtn" + (mine ? " on" : "")} disabled={atCap} onClick={() => on.must(a, mine)} title={atCap ? `All ${limit} must-dos used` : ""}>{mine ? "★ Must-do (mine)" : atCap ? "★ limit reached" : "☆ Must-do"}</button>}
         {showSchedule && <select className="schedsel" value="" onChange={(e) => on.schedule(a, e.target.value)}><option value="" disabled>＋ Into a day…</option>{days.map((d) => <option key={d.id} value={d.id}>{dow(d.date)} {d.date.slice(8)}{d.label ? ` — ${d.label.slice(0, 22)}` : ""}</option>)}</select>}
         {showMaybe && <button className="abtn" onClick={() => on.maybe(a)}>→ Maybe later</button>}
         {showDelete && <button className="abtn danger" onClick={() => on.del(a)}>Delete</button>}
+        {showRateJump && <button className="abtn soft" onClick={() => onJumpToRate(a.id)}>Edit in Rate view</button>}
       </div>}
     </div>
   );

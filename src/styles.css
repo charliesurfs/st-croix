@@ -76,6 +76,7 @@ main{padding:16px 16px 64px;}
 .abtn.on{border-color:var(--coral); background:#FBE7DF; color:var(--coral);}
 .abtn:disabled{opacity:.45; cursor:not-allowed;}
 .abtn.danger{color:#B23A28;}
+.abtn.soft{ border-color:var(--teal2); color:var(--teal); background:#F3FBFA; }
 
 /* add + maybe-later */
 .addbtn{width:100%; padding:12px; border-radius:12px; border:1.5px dashed var(--line); background:transparent; color:var(--teal); font-weight:600; font-size:13.5px; margin-top:4px;}
@@ -232,6 +233,10 @@ main{ padding-bottom:calc(env(safe-area-inset-bottom) + 80px); }
 .sortrow button{ flex:1; padding:9px; border-radius:10px; border:1.5px solid var(--line); background:#fff; color:var(--muted); font-weight:600; font-size:12.5px; }
 .sortrow button.on{ border-color:var(--teal2); background:var(--teal2); color:#fff; }
 .viewnote{ font-size:11.5px; color:var(--muted); line-height:1.45; margin:-4px 0 12px; }
+.readonlycallout{ display:flex; align-items:flex-start; justify-content:space-between; gap:12px; background:#F3FBFA; border:1px solid #C8E7E4; border-radius:13px; padding:12px; margin:0 0 12px; }
+.readonlytitle{ font-size:12px; font-weight:700; color:var(--teal); margin-bottom:4px; }
+.readonlytext{ font-size:11.5px; color:var(--muted); line-height:1.45; }
+.readonlycta{ flex-shrink:0; padding:9px 11px; border-radius:10px; border:1.5px solid var(--teal2); background:#fff; color:var(--teal); font-weight:700; font-size:12px; }
 
 /* anonymous must-do count badge (never shows who flagged) */
 .mustbadge{ font-size:10.5px; padding:2px 8px; border-radius:999px; background:#FBE7DF; color:var(--coral); font-weight:700; display:inline-flex; align-items:center; }
